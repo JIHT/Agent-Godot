@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# 密钥（永不进 git）
+.env
+
+# 运行产物
+.agent_godot/

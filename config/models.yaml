@@ -1,0 +1,95 @@
+# ============================================================
+# models.yaml —— 供应商花名册 + 模式路由（M02 配置面，唯一事实源）
+#
+# 密钥纪律：这里只写 api_key_env（环境变量名），密钥本体放 .env
+#           （backend/.env，已在 .gitignore）或系统环境变量。
+#
+# 接入新厂商三步：
+#   1. providers 节加一个条目（OpenAI 兼容厂商 provider 填 openai）
+#   2. .env 加密钥
+#   3. routing 里把想用的模式指过去
+# ============================================================
+
+providers:
+  # ---------- 本地服务（免密钥、免计费）----------
+
+  lmstudio:
+    provider: lmstudio              # OpenAI 兼容 + model 自动发现
+    base_url: http://127.0.0.1:1234/v1
+    model: auto                     # ★ auto = 首次使用时查 /v1/models 自动取
+    timeout: 300                    # 本地大模型首 token 慢，放宽
+
+  ollama:
+    provider: openai                # Ollama 的 OpenAI 兼容端点
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3:8b
+    api_key: ollama                 # 兼容端点不校验，占位即可
+
+  # ---------- 国内云端（OpenAI 兼容协议）----------
+
+  deepseek:
+    provider: openai
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    pricing: [0.27, 1.10]           # 输入/输出 美元每百万 token（V3 时价，自行核对）
+    # model 在 ref 里指定：deepseek/deepseek-chat、deepseek/deepseek-reasoner
+
+  qwen:
+    provider: openai                # 阿里 DashScope 的 OpenAI 兼容模式
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    pricing: [0.40, 1.20]
+
+  glm:
+    provider: openai                # 智谱
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_env: GLM_API_KEY
+
+  moonshot:
+    provider: openai                # Kimi
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+
+  # ---------- 海外云端 ----------
+
+  openai:
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    pricing: [2.50, 10.00]
+
+  gemini:
+    provider: openai                # Google Gemini 的 OpenAI 兼容端点
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY
+
+  anthropic:
+    provider: anthropic             # Claude 原生协议（专属信封翻译）
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    # model 如 anthropic/claude-sonnet-4-5-20250929
+
+  # ---------- 自建推理（按需解注释）----------
+  # vllm:
+  #   provider: openai
+  #   base_url: http://192.168.1.100:8000/v1
+  #   model: Qwen/Qwen2.5-Coder-7B-Instruct
+  #   api_key: dummy                 # vLLM 默认不校验
+
+# ---------- 模式路由：四模式各用哪个模型（M13 消费）----------
+# craft 改代码要稳（低温+本地/强模型）、ask 聊天要活（高温）
+# 换默认模型 = 改这几行字符串，代码零改动
+
+routing:
+  ask:
+    ref: deepseek/deepseek-chat
+    temperature: 0.7
+  craft:
+    ref: lmstudio/auto              # 本地模型改代码：免费且数据不出域
+    temperature: 0.1
+  plan:
+    ref: deepseek/deepseek-chat
+    temperature: 0.2
+  multi:
+    ref: deepseek/deepseek-chat
+    temperature: 0.3

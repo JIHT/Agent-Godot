@@ -2,7 +2,8 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Agent-Godot.iml" filepath="$PROJECT_DIR$/.idea/Agent-Godot.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/agent-godot.iml" filepath="$PROJECT_DIR$/.idea/agent-godot.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/agent-godot@1.iml" filepath="$PROJECT_DIR$/.idea/agent-godot@1.iml" />
     </modules>
   </component>
 </project>
