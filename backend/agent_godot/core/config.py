@@ -23,7 +23,7 @@ import httpx
 import yaml
 
 from .llm import ModelConfig, get_llm
-from .semantic_cache import SemanticCache
+from .semantic_cache import OllamaEmbedder, SemanticCache
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +51,28 @@ class ModelRegistry:
         self._providers: dict[str, dict] = data.get("providers") or {}
         self._routing: dict[str, dict] = data.get("routing") or {}
         self._configs: dict[str, ModelConfig] = {}   # ref → 已解析配置（缓存）
-        self._cache = SemanticCache()
+        self._cache = self._build_cache(data)
 
         if not self._providers:
             raise ValueError(f"{source} 里没有任何 providers 配置")
+
+    @staticmethod
+    def _build_cache(data: dict) -> SemanticCache:
+        """embedding 节驱动装配：enabled → 真嵌入（ollama bge-m3），
+        否则 → 假嵌入（零依赖，CI/单测环境友好）。
+
+        注意 fail-soft 语义：enabled=true 但 ollama 没启动时构造照样成功
+        （OllamaEmbedder 是懒连接），只在每次编码时返回 None 让缓存让路。
+        """
+        emb = data.get("embedding") or {}
+        if not emb.get("enabled", False):
+            return SemanticCache()
+        return SemanticCache(
+            embedder=OllamaEmbedder(
+                base_url=emb.get("base_url", "http://127.0.0.1:11434/v1"),
+                model=emb.get("model", "bge-m3")),
+            threshold=float(emb.get("cache_threshold", 0.92)),
+            ttl=float(emb.get("cache_ttl", 86400.0)))
 
     # ---------- 加载与解析 ----------
 

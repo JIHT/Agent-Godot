@@ -80,6 +80,17 @@ providers:
 # craft 改代码要稳（低温+本地/强模型）、ask 聊天要活（高温）
 # 换默认模型 = 改这几行字符串，代码零改动
 
+# ---------- 嵌入服务（M02 语义缓存 / M10 RAG / M08 记忆共用的度量衡）----------
+# 一个模型一个相似度空间：换模型 = 重建全部索引与缓存（M10 铁律）。
+# 铁律由 SemanticCache._guard_dim 自动执行：维度漂移 → 缓存全量失效。
+embedding:
+  enabled: true
+  provider: ollama                  # M10 起可切 tei（部署形态变，调用方接口不变）
+  base_url: http://127.0.0.1:11434/v1
+  model: bge-m3                     # 1024 维 · 稠密+稀疏+多向量三合一 · 多语言
+  cache_threshold: 0.92             # 语义缓存命中阈值（精度/成本旋钮：宁可 miss 不误命中）
+  cache_ttl: 86400                  # 缓存有效期（秒）
+
 routing:
   ask:
     ref: deepseek/deepseek-chat
