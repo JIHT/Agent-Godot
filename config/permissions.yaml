@@ -1,0 +1,29 @@
+# M09 权限配置（permissions.yaml）—— 产品配置面
+#
+# 求值链：deny 全表 → 精确路径规则 → 通配规则 → defaults[risk]，首个命中返回。
+# glob 锚定项目根：scripts/** 含子目录任意深度；*.gd 只匹配当前层。
+# deny 用户显式配置的安全意图不可被 allow 覆盖（黑名单绝对优先）。
+
+defaults:
+  low: allow        # 只读无副作用：快递柜自提
+  medium: ask       # 本地可逆写：刷工卡（规则里有你就能进）
+  high: ask         # 不可逆/出边界：必须本人当面开门
+
+rules:
+  # 项目源码区的写操作：内测期白名单直放（高频安全路径规则化，防确认疲劳）
+  - tool: write_file
+    paths: ["scripts/**", "scenes/**"]
+    action: allow
+
+  # 删除：任何路径都不许（deny 最高优先）
+  - tool: delete_file
+    action: deny
+
+  # headless 运行：逐次确认，但记住"本次会话不再问"
+  - tool: godot_run_scene
+    action: ask
+    remember: session
+
+  # MCP 网络类工具：逐次确认（出边界操作）
+  - tool: mcp__fetch__*
+    action: ask

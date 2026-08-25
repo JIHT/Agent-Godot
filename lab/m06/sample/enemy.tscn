@@ -1,0 +1,9 @@
+[gd_scene load_steps=2 format=3 uid="uid://m06sampleenemy"]
+
+[ext_resource type="Script" path="res://enemy.gd" id="1_enemy"]
+
+[node name="Enemy" type="CharacterBody2D"]
+script = ExtResource("1_enemy")
+
+[node name="Sprite" type="Sprite2D" parent="."]
+modulate = Color(1, 0.6, 0.6, 1)

@@ -12,15 +12,11 @@ from agent_godot.agent.dispatcher import Dispatcher
 from agent_godot.core import ToolCall
 from agent_godot.tools import ToolRegistry
 
-from .conftest import FakeLLM, done_ev, make_dispatcher, text_ev, usage_ev
+from .conftest import FakeLLM, done_ev, make_dispatcher, text_ev
 
 
 def _loop(llm, dispatcher, **kw):
     return AgentLoop(llm, dispatcher, model="test-model", **kw)
-
-
-def _always_tool(name: str = "echo", args: str = "{}"):
-    return [ToolCall(id="c1", name=name, arguments=args)]
 
 
 async def test_loop_stops_on_max_steps():
@@ -48,7 +44,8 @@ async def test_loop_stops_on_max_steps():
 
 async def test_loop_detector_intervenes():
     """连续 3 次相同调用 → 第一次劝导 → 仍重复 → 硬停 loop_detected。"""
-    llm = FakeLLM([[done_ev(_always_tool(), "tool_calls")]])
+    llm = FakeLLM([[done_ev([ToolCall(id="c1", name="echo", arguments="{}")],
+                            "tool_calls")]])
     loop = _loop(llm, make_dispatcher())
     result = await loop.run(Session("s1"), "go")
     assert result.stop_reason == "loop_detected"
@@ -56,14 +53,10 @@ async def test_loop_detector_intervenes():
 
 async def test_tool_error_becomes_observation():
     """工具抛异常 → 循环不中断，错误作为 ok=False 的 tool 消息回填，最终自然终止。"""
+    from .conftest import BoomTool, _attach_meta
+
     reg = ToolRegistry()
-
-    async def boom() -> str:
-        raise RuntimeError("boom")
-
-    reg.register(name="boom", description="会炸",
-                 parameters={"type": "object", "properties": {}},
-                 readonly=True)(boom)
+    reg.register(_attach_meta(BoomTool, "boom")())
 
     script = [
         [done_ev([ToolCall(id="c1", name="boom", arguments="{}")], "tool_calls")],
@@ -74,7 +67,7 @@ async def test_tool_error_becomes_observation():
     result = await loop.run(session, "go")
     assert result.stop_reason == "natural"
     tool_msgs = [m.content for m in session.messages if m.role == "tool"]
-    assert any("[工具执行失败]" in c for c in tool_msgs)
+    assert any("boom" in c and "internal" in c for c in tool_msgs)
 
 
 async def test_events_ordered():

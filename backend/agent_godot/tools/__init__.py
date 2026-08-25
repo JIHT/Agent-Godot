@@ -1,10 +1,23 @@
-"""tools：工具系统（M04）—— 当前是最小种子，M03 的 Dispatcher 依赖它。
+"""tools：工具系统（M04）—— 注册表（pydantic Schema 自动生成）、沙箱、乐观锁。
 
-M03/M04 交替施工：这里先落下 registry + response + 两个内置只读工具，
-够 M03 验收 demo（list_files → read_file → 总结）跑通。
-M04 正式版在此之上加：参数 schema 校验、执行沙箱、乐观锁文件编辑、更多内置工具。
+三大件：
+- registry：洞洞板（@register_tool 装饰器注册，BaseTool + Params = 单一事实源）
+- sandbox：三道安全闸（路径防护 / 超时 / 输出截断）
+- file_lock：乐观锁文件读写（content hash 版本号，冲突不自动合并）
+
+builtin/：六件套（read/write/list/search/diff/todo）。
 """
-from .registry import Tool, ToolRegistry
-from .response import ToolResponse
+from .file_lock import OptimisticFileStore, sha16
+from .registry import (BaseTool, ToolMeta, ToolRegistry, register_tool)
+from .response import Artifact, ErrorKind, ToolError, ToolResponse
+from .sandbox import (DENY_PARTS, DeniedPathError, PathEscapeError,
+                      resolve_in_root, truncate)
+from .schema import to_fc_schema
 
-__all__ = ["Tool", "ToolRegistry", "ToolResponse"]
+__all__ = [
+    "OptimisticFileStore", "sha16",
+    "BaseTool", "ToolMeta", "ToolRegistry", "register_tool",
+    "Artifact", "ErrorKind", "ToolError", "ToolResponse",
+    "DENY_PARTS", "DeniedPathError", "PathEscapeError", "resolve_in_root",
+    "truncate", "to_fc_schema",
+]

@@ -1,0 +1,51 @@
+# ============================================================
+# mcp.yaml —— MCP 服务器注册表（M05 配置面）
+#
+# 纪律：enabled 默认 false——不强制依赖外部环境（node/pip 包），
+# 按需开启。单个服务器启动失败只记日志，不拖死 Agent（本地工具照常）。
+# 加一个新服务器 = 这里加一段配置，核心代码零改动（M00"一切皆插件"）。
+# ============================================================
+
+servers:
+  # ---------- Godot 主力服务器（M05 选型定案，见 docs/adr）----------
+  # sterion66/godot-mcp-server：40 个工具，覆盖本项目 M06 规划的全部能力域——
+  #   场景（list/create/read/validate .tscn）· 脚本（create/read/validate .gd）
+  #   运行时（headless run_game / execute_script / get_log）
+  #   项目（settings 解析 / 文件搜索 / 资产库下载）
+  # 纯文件操作 + Godot CLI 路线（不依赖编辑器开着），与 M06 自研服务器同构——
+  # M06 自研完成后可无缝替换/对照。
+  # 安装：uv pip install godot-mcp-server（或 command 改用 uvx）
+  godot:
+    enabled: false
+    transport: stdio
+    command: godot-mcp-server
+    env:
+      GODOT_MCP_ROOT: "E:/godot-projects"       # Godot 项目工作区（沙箱根，按需修改）
+      GODOT_MCP_ALLOW_GODOT_EXEC: "1"           # 允许 headless 运行/执行脚本
+
+  # ---------- 本项目自研 Godot 服务器（M06，同一套工具的 MCP 出口）----------
+  # 与上面外部服务器二选一即可：自研版与 CLI 本地注册共用 register_godot_tools，
+  # 12 个领域工具（场景/脚本/校验）零重复实现。默认随 CLI 自动接入，无需走 MCP。
+  godot-local:
+    enabled: false
+    transport: stdio
+    command: python
+    args: ["-m", "agent_godot.mcp.servers.godot"]
+    env:
+      AGENT_GODOT_ROOT: "lab/m06/sample"        # Godot 项目根（按需改成绝对路径）
+      GODOT_BIN: ""                              # 可选，指向 Godot 4 可执行文件
+
+  # ---------- 官方综合测试服务器（需要 node/npx）----------
+  # everything: https://github.com/modelcontextprotocol/servers
+  everything:
+    enabled: false
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+
+  # ---------- 本项目假服务器（集成测试用，一般保持关闭）----------
+  fake:
+    enabled: false
+    transport: stdio
+    command: python
+    args: ["../lab/m05/fake_server.py"]         # 相对 backend/ 运行时解析

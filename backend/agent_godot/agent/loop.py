@@ -11,12 +11,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from agent_godot.core import LLM, LLMRequest, Message, StreamEvent, ToolCall, Usage
 from .budgets import BudgetTracker, LoopDetector
 from .dispatcher import Dispatcher
 from .events import EventBus
+
+if TYPE_CHECKING:
+    from agent_godot.tools import ToolResponse
 
 
 @dataclass
@@ -30,12 +33,14 @@ class Session:
 
 
 class ContextBuilder:
-    """上下文拼装（M07 前简单版：全量消息直出）。
+    """上下文拼装基类（M07 前简单版：全量消息直出）。
 
-    M07 会升级为：Observation 截断 + 滑动窗口 + 摘要压缩 + 预算分配拼装。
+    M07 的正式版是 agent_godot.context.ContextBuilder（分区预算+贪心降级，
+    与本类鸭子类型兼容：build(session, tools=...)），构造 AgentLoop 时注入。
     """
 
-    async def build(self, session: Session) -> list[Message]:
+    async def build(self, session: Session, *,
+                    tools: list | None = None) -> list[Message]:
         return session.messages
 
 
@@ -62,14 +67,16 @@ class AgentLoop:
     def __init__(self, llm: LLM, dispatcher: Dispatcher, *,
                  model: str, temperature: float = 0.3,
                  bus: EventBus | None = None,
-                 config: LoopConfig | None = None):
+                 config: LoopConfig | None = None,
+                 context: ContextBuilder | None = None):
         self.llm = llm
         self.dispatcher = dispatcher
         self.model = model
         self.temperature = temperature
         self.bus = bus or EventBus()
         self.config = config or LoopConfig()
-        self.context = ContextBuilder()
+        # M07：可注入 context.ContextBuilder（分区预算+压缩）；默认简单拼接
+        self.context = context or ContextBuilder()
         self.budgets = BudgetTracker(
             max_steps=self.config.max_steps,
             token_budget=self.config.token_budget,
@@ -86,15 +93,50 @@ class AgentLoop:
         if user_input:
             session.append(Message(role="user", content=user_input))
             await self.bus.emit("user_message", content=user_input)
+        return await self._drive(session)
 
+    async def continue_with(self, session: Session,
+                            done: dict[str, "ToolResponse"]) -> LoopResult:
+        """M09 §3 恢复点续跑：先回填"已完成响应表"，再继续主循环。
+
+        确认门挂起恢复后调用——同批已执行的调用用 done 表里的旧响应，
+        **绝不重放副作用**；Loop 从"观察回填"这一步接着跑。
+        """
+        self.budgets.reset()
+        self._loop_warnings = 0
+        # 已被 dispatcher.on_result 即时落盘的调用不重复回填（M09 §3 防副作用重放）
+        recorded = self._recorded_call_ids(session)
+        for call_id, resp in done.items():
+            if call_id not in recorded:
+                session.append(Message(role="tool", tool_call_id=call_id,
+                                       content=resp.render()))
+            await self.bus.emit("tool_call_result", call_id=call_id,
+                                ok=resp.ok, content=resp.render())
+        return await self._drive(session)
+
+    @staticmethod
+    def _recorded_call_ids(session) -> set[str]:
+        """session 事件流里已有 ToolDone 记录的 call_id（非事件溯源 session 返回空）。"""
+        events = getattr(session, "events", None)
+        if not events:
+            return set()
+        done_type = "ToolDone"
+        return {e.call_id for e in events
+                if type(e).__name__ == done_type}
+
+    async def _drive(self, session: Session) -> LoopResult:
+        """主循环本体（run 与 continue_with 的公共发动机）。"""
         while True:
             # ① 预算检查前置（工具本身可能跑 5 分钟，检查晚了等于没检查）
             status = self.budgets.check()
             if status.exhausted:
                 return await self._graceful_wrap_up(session, status)
 
-            # ② 每轮重建上下文
-            messages = await self.context.build(session)
+            # ② 每轮重建上下文（M07：分区预算 + 贪心降级拼装）
+            messages = await self.context.build(
+                session, tools=self.dispatcher.registry.tool_specs() or None)
+            await self._emit_layout()
+
             req = LLMRequest(
                 model=self.model, messages=messages,
                 temperature=self.temperature,
@@ -120,6 +162,7 @@ class AgentLoop:
 
             if usage:
                 self.budgets.record_usage(usage)
+                self._calibrate(usage.input_tokens)
 
             # ④ 自然终止：无工具调用 = Final Answer
             if not calls:
@@ -149,8 +192,10 @@ class AgentLoop:
             await self.bus.emit("tool_call_start", calls=[c.name for c in calls])
             results = await self.dispatcher.execute(calls)
             for r in results:
-                session.append(Message(role="tool", tool_call_id=r.call_id,
-                                       content=r.render()))
+                # M09：dispatcher.on_result 即时记账时 Loop 不再补记（防重复落盘）
+                if self.dispatcher.on_result is None:
+                    session.append(Message(role="tool", tool_call_id=r.call_id,
+                                           content=r.render()))
                 await self.bus.emit("tool_call_result", call_id=r.call_id,
                                     ok=r.ok, content=r.render())
             self.budgets.record_step()
@@ -160,6 +205,20 @@ class AgentLoop:
         if ev.type == "text_delta" and ev.text:
             await self.bus.emit("text_delta", text=ev.text)
 
+    async def _emit_layout(self) -> None:
+        """M07 trace：上轮各分区 token 占比（--trace 可查）。"""
+        layout_fn = getattr(self.context, "last_layout", None)
+        if callable(layout_fn):
+            layout = layout_fn()
+            if layout:
+                await self.bus.emit("context_layout", layout=layout)
+
+    def _calibrate(self, reported_input_tokens: int) -> None:
+        """M07 自校准：真实 usage 回执 vs 估算值 → 回归调整估算系数。"""
+        cal_fn = getattr(self.context, "calibrate", None)
+        if callable(cal_fn):
+            cal_fn(reported_input_tokens)
+
     async def _graceful_wrap_up(self, session: Session, status) -> LoopResult:
         """预算耗尽 → 优雅收尾：注入"请总结"做最后一轮（不调工具），而非抛异常。"""
         reason = status.reason or "timeout"
@@ -167,7 +226,8 @@ class AgentLoop:
             role="system",
             content=f"预算将尽（{reason}），请用一两句话总结你已完成的工作"
                     f"与尚未完成的事项，不要再调用工具。"))
-        req = LLMRequest(model=self.model, messages=session.messages,
+        messages = await self.context.build(session)   # 收尾轮同样过预算治理
+        req = LLMRequest(model=self.model, messages=messages,
                          temperature=self.temperature, tools=None)
         text_parts: list[str] = []
         usage: Usage | None = None

@@ -1,13 +1,15 @@
-"""tests/test_agent/conftest.py —— 测试夹具：剧本式 FakeLLM + 事件构造器。
+"""tests/test_agent/conftest.py —— 测试夹具：剧本式 FakeLLM + 类版测试工具。
 
 FakeLLM 实现 M02 的 LLM Protocol（只实现 stream，loop 只用 stream）——
 "不继承任何人、只认形状"的 Protocol 红利在测试里兑现：不用起真实模型。
 """
 from __future__ import annotations
 
-from agent_godot.core import StreamEvent, ToolCall, Usage
+from pydantic import BaseModel
+
 from agent_godot.agent.dispatcher import Dispatcher
-from agent_godot.tools import ToolRegistry
+from agent_godot.core import StreamEvent, ToolCall, Usage
+from agent_godot.tools import BaseTool, ToolRegistry, ToolResponse
 
 
 def text_ev(text: str) -> StreamEvent:
@@ -41,15 +43,37 @@ class FakeLLM:
             yield ev
 
 
+class EchoTool(BaseTool):
+    """回显（只读，M04 类版）。"""
+    meta = None  # 由 make_dispatcher 手工挂
+
+    class Params(BaseModel):
+        x: str = "ok"
+
+    async def run(self, x: str = "ok") -> ToolResponse:
+        return ToolResponse(ok=True, summary=x)
+
+
+class BoomTool(BaseTool):
+    """必炸工具（readonly=True：验证异常也走并发路径后被翻译）。"""
+    meta = None
+
+    class Params(BaseModel):
+        pass
+
+    async def run(self) -> ToolResponse:
+        raise RuntimeError("boom")
+
+
+def _attach_meta(tool_cls, name: str, readonly: bool = True):
+    from agent_godot.tools import ToolMeta
+    tool_cls.meta = ToolMeta(name=name, description=name, readonly=readonly)
+    return tool_cls
+
+
 def make_dispatcher() -> Dispatcher:
-    """构造带一个只读 echo 工具的 Dispatcher。"""
+    """构造带 Echo/Boom 两个测试工具的 Dispatcher。"""
     reg = ToolRegistry()
-
-    async def echo(x: str = "ok") -> str:
-        return x
-
-    reg.register(name="echo", description="回显",
-                 parameters={"type": "object",
-                             "properties": {"x": {"type": "string"}},
-                             "required": []}, readonly=True)(echo)
+    reg.register(_attach_meta(EchoTool, "echo")())
+    reg.register(_attach_meta(BoomTool, "boom")())
     return Dispatcher(reg)
