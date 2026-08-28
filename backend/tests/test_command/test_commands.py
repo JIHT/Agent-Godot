@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import pytest
-
 from agent_godot.agent import Session
 from agent_godot.command import (Command, CommandContext, CommandParser,
                                  CommandRegistry, CommandResult)
@@ -199,7 +197,8 @@ async def test_checkpoint_requires_name(tmp_path):
 async def test_skills_list_direct_and_one_line_per_skill():
     from agent_godot.skills import SkillLoader
 
-    loader = SkillLoader().scan()
+    loader = SkillLoader()
+    loader.scan()
     result = await _registry().dispatch("/skills", CommandContext(skills=loader))
     assert result.kind == "direct"
     assert result.data["count"] == len(loader.skills) >= 3
@@ -210,7 +209,8 @@ async def test_skills_list_direct_and_one_line_per_skill():
 async def test_skills_search_and_use():
     from agent_godot.skills import SkillLoader
 
-    loader = SkillLoader().scan()
+    loader = SkillLoader()
+    loader.scan()
     ctx = CommandContext(skills=loader)
     hit = await _registry().dispatch("/skills search 打包发布 Windows 版", ctx)
     assert hit.kind == "direct" and "打包发布" in hit.text
@@ -224,6 +224,8 @@ async def test_skills_search_and_use():
 async def test_skills_use_unknown_suggests_neighbor():
     from agent_godot.skills import SkillLoader
 
+    loader = SkillLoader()
+    loader.scan()
     result = await _registry().dispatch(
-        "/skills use 本地", CommandContext(skills=SkillLoader().scan()))
+        "/skills use 本地", CommandContext(skills=loader))
     assert result.kind == "direct" and "本地化" in result.text

@@ -148,12 +148,11 @@ class HookPipeline:
 
     def unregister(self, name: str) -> bool:
         """按名字摘掉 hook（测试环境禁用权限 hook 一行配置，§7 问答 9）。"""
-        for point, specs in self._hooks.items():
+        for specs in self._hooks.values():
             for i, s in enumerate(specs):
                 if s.name == name:
                     specs.pop(i)
                     return True
-            _ = point
         return False
 
     def has(self, point: str) -> bool:

@@ -139,6 +139,7 @@ class Dispatcher:
         resp = self._finalize(call, await self._safe_run(call))
         if self.hooks is not None and self.hooks.has("post_tool"):
             ctx = HookContext(point="post_tool", call_id=call.id, tool=call.name,
+                              args=_parse_args(call.arguments),
                               response=resp, session=self._hook_session())
             try:
                 ctx = await self.hooks.run("post_tool", ctx)

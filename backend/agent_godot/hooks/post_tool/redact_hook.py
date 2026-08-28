@@ -30,6 +30,12 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# 键名像凭据 → 值整块打码（不管值长什么样）
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|secret[_-]?key|token|password|passwd|"
+    r"secret|authorization|auth|credential)")
+
+
 def redact_text(text: str) -> str:
     """对一段文本做脱敏（纯函数）。无命中返回原串（调用方据此判断有没有改）。"""
     if not text:
@@ -40,14 +46,20 @@ def redact_text(text: str) -> str:
     return out
 
 
-def redact_data(data):
-    """递归脱敏结构化数据里的字符串值（data 是程序消费的，也会进 trace）。"""
+def redact_data(data, key: str | None = None):
+    """递归脱敏结构化数据（data 进 trace/记忆，泄漏面比 summary 还大）。
+
+    两种命中：①值本身像凭据（走 redact_text 的模式）②**键名**像凭据
+    （`{"token": "abc123"}`——值看着无害但语义上就是密钥，一律打码）。
+    """
     if isinstance(data, str):
+        if key and _SECRET_KEY_RE.search(key):
+            return "***"
         return redact_text(data)
     if isinstance(data, dict):
-        return {k: redact_data(v) for k, v in data.items()}
+        return {k: redact_data(v, str(k)) for k, v in data.items()}
     if isinstance(data, list):
-        return [redact_data(v) for v in data]
+        return [redact_data(v, key) for v in data]
     return data
 
 

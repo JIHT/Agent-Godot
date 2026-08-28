@@ -20,8 +20,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_godot.tools import ToolResponse  # noqa: F401 —— 类型提示/文档引用
-
 SKILL_FILE = "SKILL.md"
 
 # frontmatter：--- 开头，--- 结尾（允许 CRLF）

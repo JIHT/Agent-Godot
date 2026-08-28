@@ -6,9 +6,11 @@ Dispatcher 那几条是"插件协议宪法"：veto 必须变协议化 Observatio
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from agent_godot.agent import Dispatcher
+from agent_godot.agent import AgentLoop, Dispatcher
 from agent_godot.core import ToolCall
 from agent_godot.hooks import (FormatHook, HookContext, HookPipeline, HookResult,
                                HookSpec, HookVeto, PermissionHook, RedactHook,
@@ -85,16 +87,16 @@ async def test_permission_hook_confirm_carries_response():
 
 
 async def test_permission_hook_without_confirm_gate_vetoes():
-"""只有判定门（无 request）时：不擅自执行，按"需确认"短路。"""
+    """只有判定门（无 request）时：不擅自执行，按"需确认"短路。"""
 
-class JudgmentOnlyGate(FakeGate):
-    request = None                                   # 模拟 PermissionGate（无确认门）
+    class JudgmentOnlyGate(FakeGate):
+        request = None                               # 模拟 PermissionGate（无确认门）
 
-gate = JudgmentOnlyGate("need_confirm")
-out = await PermissionHook(gate)(
-    HookContext(point="pre_tool", tool="echo", args={}))
-assert out is not None and out.action == "veto"
-assert "未挂载确认门" in out.reason
+    gate = JudgmentOnlyGate("need_confirm")
+    out = await PermissionHook(gate)(
+        HookContext(point="pre_tool", tool="echo", args={}))
+    assert out is not None and out.action == "veto"
+    assert "未挂载确认门" in out.reason
 
 
 # ---------- Dispatcher × HookVeto 翻译层（§3） ----------
@@ -215,8 +217,8 @@ async def test_format_hook_formats_file_and_refreshes_hash(tmp_path):
     out = await FormatHook(tmp_path)(ctx)
     assert out is not None and out.action == "modify"
     assert (tmp_path / "player.gd").read_text(encoding="utf-8") == CLEAN_GD
-    assert out.response.data["hash"] == sha16(CLEAN_GD)   # ★ 新 hash
-    assert "format hook" in out.response.summary
+    assert out.modified_response.data["hash"] == sha16(CLEAN_GD)   # ★ 新 hash
+    assert "format hook" in out.modified_response.summary
 
 
 async def test_format_hook_skips_clean_or_irrelevant(tmp_path):
@@ -259,10 +261,10 @@ async def test_redact_hook_masks_secrets_in_summary_and_data():
     out = await RedactHook()(HookContext(point="post_tool", tool="echo",
                                          response=resp))
     assert out is not None and out.action == "modify"
-    assert "sk-abcdefghijklmnop" not in out.response.summary
-    assert "hunter2222" not in out.response.summary
-    assert out.response.data["token"] == "***"
-    assert out.response.data["nested"]["secret"] == "***"
+    assert "sk-abcdefghijklmnop" not in out.modified_response.summary
+    assert "hunter2222" not in out.modified_response.summary
+    assert out.modified_response.data["token"] == "***"
+    assert out.modified_response.data["nested"]["secret"] == "***"
 
 
 async def test_redact_hook_passes_when_nothing_matches():
@@ -276,6 +278,52 @@ async def test_redact_hook_ignores_gdscript_typed_declaration():
     resp = ToolResponse(ok=True, summary='var token := "x"\nvar hp := 10')
     assert await RedactHook()(HookContext(point="post_tool", tool="echo",
                                           response=resp)) is None
+
+
+async def test_dispatcher_end_to_end_format_and_redact(tmp_path):
+    """§5 验收 Demo①：写"丑" .gd → 落盘即格式化，模型不需要知道缩进规则。"""
+    dispatcher = make_dispatcher(tmp_path)
+    dispatcher.hooks = _pipeline(FormatHook(tmp_path).spec(),
+                                 RedactHook().spec())
+    call = ToolCall(id="c1", name="write_script",
+                    arguments=json.dumps({"path": "player.gd",
+                                          "content": UGLY_GD}))
+    results = await dispatcher.execute([call])
+    assert (tmp_path / "player.gd").read_text(encoding="utf-8") == CLEAN_GD
+    assert results[0].ok is True
+    assert "format hook" in results[0].summary          # 模型看到"被整理过了"
+
+
+async def test_loop_runs_pre_loop_and_post_loop_hooks():
+    """六挂载点里 Loop 负责的两个：pre_loop 注入消息 / post_loop 收尾上报。"""
+    from agent_godot.agent import Session
+    from agent_godot.core import Message
+
+    from ..test_agent.conftest import FakeLLM, done_ev, text_ev
+
+    log: list[str] = []
+
+    async def inject(ctx: HookContext):
+        log.append("pre")
+        return HookResult.modify(messages=[Message(role="system",
+                                                   content="预算告警：已用 80%")])
+
+    async def report(ctx: HookContext):
+        log.append("post")
+        return None
+
+    pipeline = _pipeline(
+        HookSpec(name="budget", point="pre_loop", priority=10, handler=inject),
+        HookSpec(name="reporter", point="post_loop", priority=10, handler=report))
+    dispatcher = make_dispatcher()
+    loop = AgentLoop(FakeLLM([[text_ev("收到"), done_ev(None, "stop")]]),
+                     dispatcher, model="m", hooks=pipeline)
+    session = Session(session_id="s1")
+    result = await loop.run(session, "hi", mode="ask")
+
+    assert result.stop_reason == "natural"
+    assert log == ["pre", "post"]                        # 两个挂载点都跑了
+    assert any(m.content == "预算告警：已用 80%" for m in session.messages)
 
 
 # ---------- build_default_pipeline ----------

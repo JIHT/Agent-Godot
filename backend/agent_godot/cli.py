@@ -84,6 +84,15 @@ async def _cli_plan_approver(plan_text: str) -> bool:
     return await asyncio.to_thread(ask)
 
 
+def _clean_input(text: str | None) -> str:
+    """清洗终端输入：去 BOM 与首尾空白。
+
+    PowerShell 管道喂进来的首行会带 \\ufeff——不去掉的话 `/skills list`
+    被判成普通对话（不以 / 开头）→ 白白烧一轮模型调用。
+    """
+    return (text or "").replace("\ufeff", "").strip()
+
+
 def _make_recorder(session):
     """dispatcher.on_result 钩子：单调用完成即 ToolDone 事件落盘（M09 §3）。"""
     from agent_godot.core import Message
@@ -159,6 +168,10 @@ async def _build_agent(question_mode: str, model_ref: str | None,
     # ---- M14 skills：目录常驻 + skill_search/skill_use 交给模型按需取全文 ----
     skills = install_skills(reg, session=session)
 
+    # ---- M15 子代理花名册（内置三角色 + .agent_godot/agents/*.md 自定义）----
+    from agent_godot.agent.subagents.builtin import build_all_specs
+    subagent_specs = build_all_specs(reg)
+
     # ---- M14 hooks：把 M09 门禁包成 pre_tool(p=0)，脱敏(p=90)/格式化(p=100) ----
     hooks = build_default_pipeline(gate=gate, dispatcher=dispatcher,
                                    format_root=base_root)
@@ -183,7 +196,8 @@ async def _build_agent(question_mode: str, model_ref: str | None,
     commands = CommandRegistry().install_builtins()
     ctx = CommandContext(session=session, manager=manager, skills=skills,
                          compressor=compressor, loop=loop, model=model_name,
-                         mode=question_mode, project_root=base_root)
+                         mode=question_mode, project_root=base_root,
+                         extra={"subagent_specs": subagent_specs})
     stack = AgentStack(llm=llm, loop=loop, dispatcher=dispatcher,
                        manager=manager, session=session, rules=rules,
                        hooks=hooks, skills=skills, commands=commands,
@@ -220,12 +234,20 @@ async def _run_hook(hooks, point: str, session, **extra) -> None:
 
 
 async def _run_turn(stack: AgentStack, text: str, mode: str):
-    """跑一轮：plan 模式走 DAG 外循环，其余走 ReAct 主循环（M13）。"""
+    """跑一轮：plan/multi 走各自的外循环，其余走 ReAct 主循环（M13/M15）。"""
     if mode == "plan":
         from agent_godot.agent.paradigms import PlanStrategy
         strategy = PlanStrategy(llm=stack.llm, loop=stack.loop,
                                 approver=_cli_plan_approver)
         return await strategy.run_plan_mode(stack.session, text)
+    if mode == "multi":
+        # M15：Orchestrator 拆活 → 冲突分组 → 并发派生子代理 → 聚合交付
+        from agent_godot.agent.paradigms import MultiStrategy
+        strategy = MultiStrategy(llm=stack.llm, loop=stack.loop,
+                                 registry=stack.dispatcher.registry,
+                                 bus=stack.loop.bus,
+                                 specs=stack.ctx.extra.get("subagent_specs"))
+        return await strategy.run_multi_mode(stack.session, text)
     return await stack.loop.run(stack.session, text, mode=mode)
 
 
@@ -258,6 +280,7 @@ async def run_ask(question: str, mode: str, model_ref: str | None,
                   root: Path | None, godot_root: Path | None = None) -> None:
     stack = await _build_agent(mode, model_ref, root, godot_root)
     session = stack.session
+    question = _clean_input(question)
     stack.loop.bus = EventBus()
     bus = stack.loop.bus
 
@@ -305,7 +328,7 @@ async def run_chat(initial: str | None, model_ref: str | None,
         while True:
             if pending is None:
                 pending = await asyncio.to_thread(input, "\n你> ")
-            text = (pending or "").strip()
+            text = _clean_input(pending)
             pending = None
             if not text:
                 continue
@@ -376,7 +399,7 @@ async def run_resume(session_id: str | None, model_ref: str | None,
             # 续聊：纪要已在事件流里，直接以新输入驱动（L3 会话级恢复）
             question = await asyncio.to_thread(
                 input, "[resume] 继续对话（输入内容）: ")
-            question = (question or "").strip()
+            question = _clean_input(question)
             if stack.commands.parser.is_command(question):
                 cmd_result = await stack.commands.dispatch(question, stack.ctx)
                 mode, question = await _apply_command_result(cmd_result, stack,
@@ -429,6 +452,29 @@ async def _render_events(bus: EventBus) -> None:
             print(f"\n[确认门] {p.get('tool', '')}（{p.get('risk', '')}）等待批准…")
         elif t == "loop_warning":
             print("\n[循环] 检测到重复调用，已提示模型换思路")
+        elif t == "orchestrator_plan":              # M15：拆解与分组快照
+            print(f"\n[编排] 拆出 {len(p.get('subtasks', []))} 个子任务，"
+                  f"分 {len(p.get('groups', []))} 组（组间并行/组内串行）")
+            for i, g in enumerate(p.get("groups", []), 1):
+                print(f"  第{i}组: {' → '.join(g)}")
+        elif t == "subtask_start":
+            targets = p.get("write_targets") or []
+            suffix = f"（写目标: {', '.join(targets)}）" if targets else ""
+            print(f"\n[子代理] {p.get('title', '')} ← {p.get('spec', '')}{suffix}")
+        elif t == "subagent_start":
+            print(f"    模型 {p.get('model')} · 白名单工具 "
+                  f"{len(p.get('tools') or [])} 个")
+        elif t == "subagent_done":
+            print(f"    收工: {p.get('spec', '')} · {p.get('tokens')} token"
+                  f" · stop={p.get('stop_reason')}")
+        elif t == "subtask_done":
+            print(f"  ↳ {p.get('title', '') or p.get('spec', '')}: "
+                  f"{'通过' if p.get('ok') else p.get('stop_reason')}")
+        elif t == "subtask_retry":
+            print(f"  ↳ 重派（第{p.get('attempt')}次，原因: {p.get('reason')}）")
+        elif t == "a2a_input_required":
+            print(f"\n[确认门] 远程 Agent {p.get('agent')} 需要补充信息："
+                  f"{str(p.get('question', ''))[:200]}")
         elif t == "context_layout":
             layout = p.get("layout", {})
             total = sum(v for k, v in layout.items() if k != "total")

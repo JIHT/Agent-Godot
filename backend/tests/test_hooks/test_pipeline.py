@@ -14,8 +14,9 @@ from agent_godot.hooks import (HookContext, HookPipeline, HookResult,
 from .conftest import counting_hook
 
 
-def _ctx(**kw) -> HookContext:
-    return HookContext(point="pre_tool", tool="echo", args={"x": "0"}, **kw)
+def _ctx(args: dict | None = None, **kw) -> HookContext:
+    return HookContext(point="pre_tool", tool="echo",
+                       args={"x": "0"} if args is None else args, **kw)
 
 
 async def test_hooks_run_in_priority_order():

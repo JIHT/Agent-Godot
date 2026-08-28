@@ -250,7 +250,12 @@ async def test_unknown_command_suggests_neighbors():
 
 | 日期 | 坑 | 现象 | 根因 | 解法 | 关联知识点 |
 |---|---|---|---|---|---|
-|     |    |     |     |    |          |
+| 2026-08-28 | post_tool 的 HookContext 没带 args | FormatHook 死活不触发：写完 .gd 磁盘纹丝不动 | 构造 post_tool 现场时只填了 `response`，`args` 是空 dict → `_target_path()` 取不到路径直接 pass | `_run_one` 里补 `args=_parse_args(call.arguments)`；**补一条端到端单测**（模型写丑代码 → 断言磁盘已格式化），单元测 hook 本身测不出这个 | §1.1 三动作 / §3 翻译层 |
+| 2026-08-28 | 格式化 hook 改了磁盘却不更新 hash | 模型下一次 write 必 CONFLICT（"文件已被外部修改"） | 乐观锁按内容 hash 判版本，hook 在工具写完后又改了一次内容，工具返回的 hash 当场失效 | hook 改写响应时同步 `data["hash"]=sha16(新内容)` 并写进 summary；**改现实的 hook 必须维护受它影响的所有不变量** | M04 乐观锁 / §1.1 ⑤ |
+| 2026-08-28 | 确认门批准后工具被执行两次 | 事件流里出现两条 ToolDone，副作用重放 | need_confirm 若返回 pass，Dispatcher 会在管线之外再执行一次（确认门内部已经执行过一次） | 确认门分支用 `HookResult.veto(response=..., reported=True)` 把结果带回：veto=短路不再执行，response=结果不丢，reported=不重复记账 | §1.2 / M09 §3 恢复点 |
+| 2026-08-28 | 脱敏正则误伤 GDScript 声明 | `var token := "x"` 被改成 `var token: ***"x"`，模型读到的是坏代码 | `[:=]` 同时匹配了类型推断符号 `:=` | 分隔符改写成 `(?::(?!=)|=)`——冒号后紧跟等号时不算键值分隔；**误伤的代价比漏网高**（漏网只是没脱敏，误伤是污染上下文） | §1.1 ⑤ / §4 步骤 3 |
+| 2026-08-28 | PowerShell 管道喂进来的首行带 BOM | `/skills list` 被当成普通对话送进模型，白烧一轮 401 | PowerShell 5.1 管道给原生命令的首行加 UTF-8 BOM，Python 按 GBK 控制台编码解码成乱码前缀 → `is_command()` 判 False | `_clean_input()` 去 BOM 与空白（UTF-8 解码时有效）；交互式输入无 BOM，属测试夹具问题不是产品缺陷 | §1.2 解析 |
+| 2026-08-28 | §7 问答 3 的 priority 段位描述自相矛盾 | "50-99 安全类" 却说"安全类永远后跑"——按 priority 小者先跑，安全类明明先跑 | 原文把"最终裁决权"和"执行顺序"混为一谈 | 按 §1.1 ② 的"脱敏→格式化"落地：redact p=90 先跑、format p=100 后跑；真正的"最终裁决权"是 pre_tool 的 veto（p=0），不是 post_tool 的改写顺序 | §1.1 / §7 问答 3 |
 
 ---
 

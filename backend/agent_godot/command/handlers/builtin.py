@@ -70,6 +70,41 @@ async def cmd_skills(cmd: Command, ctx: CommandContext) -> CommandResult:
                                     raw=cmd.raw), ctx)
 
 
+@register_command("agents", help="子代理角色：list（默认）/ show <角色>",
+                  usage="/agents [list|show coder]")
+async def cmd_agents(cmd: Command, ctx: CommandContext) -> CommandResult:
+    """M15 花名册：内置三角色 + .agent_godot/agents/*.md 自定义 + A2A 远程。
+
+    查询型（direct）：列角色不消耗 token，模型故障时照样能查（逃生舱原则）。
+    """
+    from agent_godot.agent.subagents.builtin import (build_all_specs,
+                                                     describe_specs)
+
+    specs = ctx.extra.get("subagent_specs")
+    if not specs:
+        registry = getattr(getattr(ctx.loop, "dispatcher", None),
+                           "registry", None)
+        specs = build_all_specs(registry) if registry is not None else {}
+    sub = cmd.sub
+    rest = cmd.rest or cmd.args.strip()
+    if sub in ("show", "info", "s") or (sub and sub in specs):
+        name = rest if sub in ("show", "info", "s") else sub
+        spec = specs.get(name)
+        if spec is None:
+            return CommandResult.direct(
+                f"没有角色 {name!r}\n可用: {', '.join(sorted(specs))}")
+        return CommandResult.direct(
+            f"{spec.name}（{'A2A 远程' if spec.is_remote else '本地'}）\n"
+            f"模型: {spec.model}\n"
+            f"预算: steps={spec.budget.steps} tokens={spec.budget.tokens} "
+            f"wall={spec.budget.wall_time:.0f}s\n"
+            f"工具({len(spec.tools.names())}): "
+            f"{', '.join(spec.tools.names()) or '（无）'}\n"
+            f"角色提示:\n{spec.role_prompt}")
+    return CommandResult.direct(describe_specs(specs),
+                                data={"count": len(specs)})
+
+
 @register_command("model", help="查看 / 切换当前模型", usage="/model [模型引用]")
 async def cmd_model(cmd: Command, ctx: CommandContext) -> CommandResult:
     ref = cmd.args.strip()
@@ -249,5 +284,5 @@ def _apply_compaction(session, summary: Message) -> None:
         pass
 
 
-__all__ = ["cmd_checkpoint", "cmd_compact", "cmd_help", "cmd_model",
-           "cmd_plan", "cmd_rewind", "cmd_skills"]
+__all__ = ["cmd_agents", "cmd_checkpoint", "cmd_compact", "cmd_help",
+           "cmd_model", "cmd_plan", "cmd_rewind", "cmd_skills"]
