@@ -6,6 +6,14 @@
   → ⑤ 死循环劝导 → ⑥ 执行工具回填
 任何一步挪位置都会引入"超支一轮 / 丢一次观察"的 bug。
 
+★ 本循环是**四模式共用的底座**（M13 §1.3 范式×模式矩阵里 ReAct 一栏四模式
+全为"✅ 强制"）。ask/craft/plan/multi 不是四套循环，而是挂在本循环上的
+四组"契约配置"（策略对象）：改的是工具视图、采样参数、钩子，循环本体不动。
+
+同理，本循环不是"ask 模式专属"——craft 的验证回路、plan 的 DAG 节点执行
+（loop.run(mode="craft")）都复用这一个循环。模式与范式是两层正交的概念，
+详见 M13 §1.3。
+
 消费 M02 的 StreamEvent（adapter 已把 SSE 翻译成统一事件），不再碰 StreamAggregator。
 """
 from __future__ import annotations
@@ -14,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from agent_godot.core import LLM, LLMRequest, Message, StreamEvent, ToolCall, Usage
+from agent_godot.hooks import HookContext, HookPipeline, HookVeto
 from .budgets import BudgetTracker, LoopDetector
 from .dispatcher import Dispatcher
 from .events import EventBus
@@ -69,7 +78,8 @@ class AgentLoop:
                  bus: EventBus | None = None,
                  config: LoopConfig | None = None,
                  context: ContextBuilder | None = None,
-                 verify_runner=None, approver=None):
+                 verify_runner=None, approver=None,
+                 hooks: HookPipeline | None = None):
         self.llm = llm
         self.dispatcher = dispatcher
         self.model = model
@@ -88,6 +98,9 @@ class AgentLoop:
         # M13：模式策略装配资源——craft 的客观验证器 / plan 的审批回调
         self.verify_runner = verify_runner
         self.approver = approver
+        # M14：HookPipeline（pre_loop 可注入消息 / post_loop 可上报）。
+        # pre_tool、post_tool 挂在 Dispatcher 上（工具级横切），不在这里。
+        self.hooks = hooks
         self._strategy = None
 
     async def run(self, session: Session, user_input: str | None,
@@ -167,6 +180,13 @@ class AgentLoop:
                 session.append(m)
             temperature = strategy.config.temperature
             top_p = strategy.config.top_p
+        # M14：pre_loop 钩子（预算告警/记忆召回等注入消息）；策略消息在前，
+        # hook 消息在后——hook 是横切层，可以看见并覆盖策略层的注入
+        if self.hooks is not None and self.hooks.has("pre_loop"):
+            ctx = await self.hooks.run(
+                "pre_loop", HookContext(point="pre_loop", session=session))
+            for m in ctx.messages:
+                session.append(m)
         try:
             while True:
                 # 推进控制（plan/multi 扩展点，默认 True）
@@ -251,6 +271,16 @@ class AgentLoop:
                             session.append(Message(role="system", content=feedback))
                 self.budgets.record_step()
         finally:
+            # M14：post_loop 钩子（死循环上报/统计）。veto 在这里没有语义
+            # （没有"被否决的执行"），吞掉即可——不能让它盖掉真实结果。
+            if self.hooks is not None and self.hooks.has("post_loop"):
+                try:
+                    await self.hooks.run(
+                        "post_loop",
+                        HookContext(point="post_loop", session=session,
+                                    extra={"steps": self.budgets.steps}))
+                except HookVeto:
+                    pass
             if original_registry is not None:
                 self.dispatcher.registry = original_registry
 

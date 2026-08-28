@@ -76,7 +76,7 @@
 | M10 RAG | S7 | [M10-RAG.md](./docs/modules/M10-RAG.md) | `agent_godot/rag/` | §2.5 §6.5 |
 | M11 GraphRAG | S8 | [M11-GraphRAG.md](./docs/modules/M11-GraphRAG.md) | `agent_godot/graphrag/` | §6.6 |
 | M12 Query Engine | S8 | [M12-QueryEngine.md](./docs/modules/M12-QueryEngine.md) | `agent_godot/query_engine/` | §3.7 §6.7 |
-| M13 范式与四模式 | S9 | [M13-范式与四模式.md](./docs/modules/M13-范式与四模式.md) | `agent/paradigms/` | §3.2-3.4 §6.13 |
+| M13 四模式引擎（范式×模式） | S9 | [M13-范式与四模式.md](./docs/modules/M13-范式与四模式.md) | `agent/paradigms/` | §3.2-3.4 §6.13 |
 | M14 Hooks/Cmd/Skills | S10 | [M14-Hooks-Command-Skills.md](./docs/modules/M14-Hooks-Command-Skills.md) | `hooks/ command/ skills/` | §6.15 §6.17 |
 | M15 Subagent/A2A | S10 | [M15-Subagent-A2A.md](./docs/modules/M15-Subagent-A2A.md) | `agent/orchestrator.py` | §3.4 §6.14 |
 | M16 STT 语音 | S11 | [M16-STT语音.md](./docs/modules/M16-STT语音.md) | `agent_godot/voice/` | §6.18 |
@@ -861,20 +861,33 @@ fallback: [deepseek-chat, lmstudio/qwen2.5-coder-7b-instruct]
 
 ### 6.13 Agent 执行引擎与四模式（F04）
 
-**需求**：产品核心。四模式：
+**需求**：产品核心。四模式 = 四份**人机协作契约**（产品层概念），由工具权限 / 审批门 / 自主度 / 编排形态四个正交维度刻画：
 
-| 模式 | 范式映射 | 工具面 | 交互 |
-|---|---|---|---|
-| **ask** | CoT + RAG 检索（只读 ReAct） | 只读：read/search/kb/graph/web | 即问即答流式 |
-| **plan** | Plan-and-Solve | Planner 专用（生成 DAG JSON） | 产出可编辑计划 → 确认 |
-| **craft** | ReAct + Reflection | 全量（写操作走确认门） | 自主执行 + 自检回路 |
-| **multi** | 多智能体编排 | 主 Agent 派生 subagent | 并行进度可视化 |
+| 模式 | 定位 | 工具面 | 审批门 | 编排形态 | 交互 |
+|---|---|---|---|---|---|
+| **ask** | 顾问：只答不改 | 只读：read/search/kb/graph/web | 无 | 单代理 | 即问即答流式 |
+| **craft** | 执行者：自主干到底 | 全量（写操作走确认门） | 操作级（M09） | 单代理 | 自主执行 + 自检回路 |
+| **plan** | 架构师：先出图纸人批准 | 全量（规划期只研究不写） | 任务级（DAG 审批） | 单代理 | 产出可编辑计划 → 确认 |
+| **multi** | 车队：并行派发 | per_worker（子代理白名单） | 任务级 + 聚合确认 | **多代理并行** | 并行进度可视化 |
+
+**★ 模式 ⊥ 范式（两层正交，不可绑定）**：模式是产品层的"人机协作契约"，回答"模型能做什么、要不要问人"；范式（ReAct / Reflection / Plan-and-Solve / Multi-Agent）是技术层的"执行机制"，回答"循环怎么组织、怎么纠错、怎么规划"。范式在各模式下**按需组合启用**，由实际问题决定：
+
+| 范式 \ 模式 | ask | craft | plan | multi |
+|---|---|---|---|---|
+| ReAct（循环底座） | ✅ 强制 | ✅ 强制 | ✅ 强制 | ✅ 强制 |
+| Reflection（客观验证） | ➖ | ✅ 写后校验 | ✅ 节点判据 | ✅ per_task |
+| Plan-and-Solve（DAG） | ➖ | ⚪ 模型隐式拆解 | ✅ 显式 DAG+审批 | ✅ 显式+并行 |
+| Multi-Agent（编排） | ➖ | ➖ | ➖ | ✅ Orchestrator |
+
+（✅ 强制 / ⚪ 模型自主决定 / ➖ 不适用）
+
+铁证：plan 模式的每个 DAG 节点调用 `loop.run(mode="craft")` 开 craft 子循环——**一次 plan 执行就同时用到 Plan-and-Solve + ReAct + Reflection 三个范式**。详见 M13 §1.3。
 
 **设计要点**：
 - 状态机：`created→running→(waiting_confirm)→running→succeeded/failed/cancelled`；事件溯源（Event Sourcing）：状态变化=追加事件（`run_events` 表），断线重连=重放事件流恢复 UI。
 - 预算熔断：max_steps（默认 25）/max_tokens/max_tool_calls/超时（wall clock），到达即优雅停止并汇报已完成部分。
 - 中断恢复：run 挂起（等确认/用户离线）持久化全部 messages，恢复后续跑（`resume`）。
-- craft 自检回路（3.3 落地）：代码改动 → `run_godot --check-only` → 失败则错误回填自动修复（≤3 轮）→ 仍失败触发 Reflection 报告。
+- craft 自检回路（Reflection 范式在 craft 模式的启用，3.3 落地）：代码改动 → `run_godot --check-only` → 失败则错误作为 Observation 回填、模型自动修复（≤3 轮）→ 仍失败**升级给用户**（继续修 / `/rewind` 回滚），绝不静默交卷。
 - 模式切换提示词：每模式独立 system prompt 模板（Jinja2 管理，版本化），含 Godot 领域规范（命名、节点组织、信号使用等）。
 
 | 📚知识点 | 说明 | 面试高频考点 |

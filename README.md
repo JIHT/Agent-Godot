@@ -16,7 +16,7 @@
 
 - 🎮 **垂直领域**：绑定本地 Godot 项目目录，Agent 阅读/修改源码（GDScript/C#）、生成 Diff 并确认应用、自动 headless 校验与测试、一键回滚检查点
 - 🔌 **MCP + Function Call 双轨工具**：自研 Godot MCP Server（项目选择 / 场景树 / 脚本读写 / headless 运行），可自由接入自定义与联网 MCP 服务器
-- 🤖 **四种前沿模式**：`ask`（问答）/ `plan`（规划 DAG）/ `craft`（执行+自检）/ `multi`（多智能体并行）—— 分别落地 ReAct、Plan-and-Solve、Reflection、Multi-Agent 经典范式
+- 🤖 **四种前沿模式**：`ask`（顾问·只答不改）/ `craft`（执行者·自主干到底）/ `plan`（架构师·先出图纸人批准）/ `multi`（车队·并行派发）—— 对齐 CodeBuddy 三模式并参考 Cursor 新增 `multi`；ReAct / Reflection / Plan-and-Solve / Multi-Agent 四大范式在各模式下**按需组合启用**（模式与范式两层正交，不绑定）
 - 🧠 **模型可配置**：Cursor 式 `config/models.yaml`，云端 API（DeepSeek/Qwen/GLM…）与本地模型（LM Studio / Ollama / vLLM）即插即用
 - 🎓 **微调闭环**：本地模型支持 SFT → LoRA → GRPO（Agentic RL）训练管线，用自建 GodotBench 量化"基座 → SFT → LoRA → GRPO"四级能力曲线
 - 📚 **个人 RAG 知识库**：上传文档/URL 建库（Milvus 混合检索 + 重排 + 引用溯源），预置 Godot 官方文档库，可勾选"联网搜索 / 知识库检索"

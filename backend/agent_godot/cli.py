@@ -5,6 +5,12 @@ M03/M04 验收入口：`godot-agent ask "问题"`。
 
 工作流：load_registry → 按 mode 取 LLM → build_default_registry（M04 六件套）
 → Dispatcher/Loop → 消费者并发打印事件流 → loop.run → 收尾。
+
+M14 接线：三条扩展轴都在这里装配（核心代码零改动）——
+- hooks    ：pre_tool 权限门 / post_tool 脱敏+格式化，session_end 时 join 后台任务
+- command  ：斜杠命令（/help /compact /rewind /skills /plan /model /checkpoint）
+             绕过模型直达功能；`chat` 子命令是交互式会话壳
+- skills   ：目录常驻 + skill_search/skill_use 工具（模型按需取手册）
 """
 from __future__ import annotations
 
@@ -13,11 +19,16 @@ import asyncio
 import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agent_godot.agent import AgentLoop, Dispatcher, EventBus
-from agent_godot.core import load_registry
+from agent_godot.command import CommandContext, CommandRegistry, CommandResult
+from agent_godot.core import Message, load_registry
+from agent_godot.hooks import HookContext, HookVeto, build_default_pipeline
 from agent_godot.mcp.client import McpManager
+from agent_godot.skills import SkillLoader, install_skills
 from agent_godot.tools.builtin import build_default_registry
 
 
@@ -83,10 +94,31 @@ def _make_recorder(session):
     return record
 
 
+@dataclass
+class AgentStack:
+    """一次运行的全部装配结果（M14 三条扩展轴的资源都挂在上面）。"""
+
+    llm: Any
+    loop: AgentLoop
+    dispatcher: Dispatcher
+    manager: Any
+    session: Any
+    rules: Any
+    hooks: Any                      # HookPipeline
+    skills: SkillLoader
+    commands: CommandRegistry
+    model: str
+    ctx: CommandContext
+    root: Path
+
+
 async def _build_agent(question_mode: str, model_ref: str | None,
                        root: Path | None, godot_root: Path | None,
-                       create_session: bool = True):
-    """run_ask / run_resume 共用的组装：LLM + 工具 + 上下文 + 权限门 + 会话。"""
+                       create_session: bool = True) -> AgentStack:
+    """run_ask / run_chat / run_resume 共用的组装：
+
+    LLM + 工具 + 上下文 + 权限门 + 会话 + M14 三件套（hooks/skills/command）。
+    """
     from agent_godot.permission.confirm import ConfirmGate
     from agent_godot.permission.rules import RuleEngine
     from agent_godot.session import SessionManager
@@ -124,48 +156,176 @@ async def _build_agent(question_mode: str, model_ref: str | None,
     if session is not None:
         dispatcher.on_result = _make_recorder(session)   # ToolDone 即时落盘
 
+    # ---- M14 skills：目录常驻 + skill_search/skill_use 交给模型按需取全文 ----
+    skills = install_skills(reg, session=session)
+
+    # ---- M14 hooks：把 M09 门禁包成 pre_tool(p=0)，脱敏(p=90)/格式化(p=100) ----
+    hooks = build_default_pipeline(gate=gate, dispatcher=dispatcher,
+                                   format_root=base_root)
+    dispatcher.hooks = hooks            # 挂上后门禁走管线（不再内联 gate.check）
+    dispatcher.session = session
+
     # M07 上下文工程：分区预算 + 保留配对滚动 + 三档压缩 + usage 自校准
     from agent_godot.context import (BudgetConfig, Compressor, ContextBuilder,
                                      HistoryManager, TokenCounter)
     counter = TokenCounter()
+    compressor = Compressor(llm=llm, model=model_name)
     context = ContextBuilder(
         counter=counter,
-        compressor=Compressor(llm=llm, model=model_name),
+        compressor=compressor,
         config=BudgetConfig(),
         history=HistoryManager(counter),
         model=model_name)
     loop = AgentLoop(llm, dispatcher, model=model_name, bus=None, context=context,
-                     verify_runner=godot_ctx.runner if godot_ctx else None)
-    return llm, loop, dispatcher, manager, session, rules
+                     verify_runner=godot_ctx.runner if godot_ctx else None,
+                     hooks=hooks)
+
+    commands = CommandRegistry().install_builtins()
+    ctx = CommandContext(session=session, manager=manager, skills=skills,
+                         compressor=compressor, loop=loop, model=model_name,
+                         mode=question_mode, project_root=base_root)
+    stack = AgentStack(llm=llm, loop=loop, dispatcher=dispatcher,
+                       manager=manager, session=session, rules=rules,
+                       hooks=hooks, skills=skills, commands=commands,
+                       model=model_name, ctx=ctx, root=base_root)
+    ctx.set_model = _make_model_switcher(stack, registry)
+    return stack
+
+
+def _make_model_switcher(stack: AgentStack, registry):
+    """/model 的切换回调：换 llm 实例 + 换 loop 上的模型名（同步执行）。"""
+
+    def switch(ref: str) -> str:
+        llm = registry.llm(ref)
+        name = registry.get(ref).model
+        stack.llm = llm
+        stack.loop.llm = llm
+        stack.loop.model = name
+        stack.model = name
+        stack.ctx.model = name
+        return name
+
+    return switch
+
+
+async def _run_hook(hooks, point: str, session, **extra) -> None:
+    """session_start / session_end：会话级挂载点（veto 在这两个点没有语义）。"""
+    if hooks is None or not hooks.has(point):
+        return
+    try:
+        await hooks.run(point, HookContext(point=point, session=session,
+                                           extra=extra))
+    except HookVeto:
+        pass
+
+
+async def _run_turn(stack: AgentStack, text: str, mode: str):
+    """跑一轮：plan 模式走 DAG 外循环，其余走 ReAct 主循环（M13）。"""
+    if mode == "plan":
+        from agent_godot.agent.paradigms import PlanStrategy
+        strategy = PlanStrategy(llm=stack.llm, loop=stack.loop,
+                                approver=_cli_plan_approver)
+        return await strategy.run_plan_mode(stack.session, text)
+    return await stack.loop.run(stack.session, text, mode=mode)
+
+
+async def _apply_command_result(result: CommandResult, stack: AgentStack,
+                                mode: str) -> tuple[str, str | None]:
+    """把命令产出落到会话/循环上，返回 (新 mode, 要不要继续跑循环的文本)。
+
+    - direct       → 打印完事（不进模型，省一轮调用）
+    - prompt_inject→ 切模式 + 把任务交回循环（命令是入口不是执行者）
+    - state_change → 系统已干完，把"世界变了"告诉模型（否则它基于旧历史困惑）
+    """
+    if result.kind == "direct":
+        if result.text:
+            print(f"\n{result.text}")
+        return result.new_mode or mode, None
+    if result.kind == "prompt_inject":
+        new_mode = result.new_mode or mode
+        if new_mode != mode:
+            print(f"\n[模式] {mode} → {new_mode}")
+        return new_mode, result.text
+    new_mode = result.new_mode or mode
+    if result.text:
+        print(f"\n{result.text}")
+        if stack.session is not None:
+            stack.session.append(Message(role="system", content=result.text))
+    return new_mode, None
 
 
 async def run_ask(question: str, mode: str, model_ref: str | None,
                   root: Path | None, godot_root: Path | None = None) -> None:
-    llm, loop, dispatcher, manager, session, rules = await _build_agent(
-        mode, model_ref, root, godot_root)
-    loop.bus = EventBus()
-    bus = loop.bus
+    stack = await _build_agent(mode, model_ref, root, godot_root)
+    session = stack.session
+    stack.loop.bus = EventBus()
+    bus = stack.loop.bus
 
     # MCP 服务器接入（mcp.yaml；单个失败不拖死 Agent，本地工具照常）
-    mcp = McpManager(dispatcher.registry)
+    mcp = McpManager(stack.dispatcher.registry)
     await mcp.start_all()
+    await _run_hook(stack.hooks, "session_start", session)
+    result = None
     try:
         consumer = asyncio.create_task(_render_events(bus))
-        if mode == "plan":
-            # plan 模式走 DAG 外循环（生成计划 → 人审批 → 拓扑执行 → re-plan）
-            from agent_godot.agent.paradigms import PlanStrategy
-            strategy = PlanStrategy(llm=llm, loop=loop,
-                                    approver=_cli_plan_approver)
-            result = await strategy.run_plan_mode(session, question)
-        else:
-            result = await loop.run(session, question, mode=mode)
+        # M14：斜杠命令绕过模型直达功能（`godot-agent ask "/skills list"`）
+        if stack.commands.parser.is_command(question):
+            cmd_result = await stack.commands.dispatch(question, stack.ctx)
+            mode, question = await _apply_command_result(cmd_result, stack, mode)
+        if question:
+            result = await _run_turn(stack, question, mode)
         await bus.close()
         await consumer
     finally:
+        await _run_hook(stack.hooks, "session_end", session)
+        await stack.hooks.join_background(timeout=5.0)   # 后台 hook 落地兜底
         await mcp.stop_all()
-        _save_grants(manager, session.session_id, rules)
-    print(f"\n[结束] stop_reason={result.stop_reason} steps={result.steps} "
-          f"session={session.session_id}")
+        _save_grants(stack.manager, session.session_id, stack.rules)
+    if result is not None:
+        print(f"\n[结束] stop_reason={result.stop_reason} steps={result.steps} "
+              f"session={session.session_id}")
+
+
+async def run_chat(initial: str | None, model_ref: str | None,
+                   root: Path | None, godot_root: Path | None) -> None:
+    """交互式会话壳：斜杠命令与对话并存（命令定入口，模糊意图走对话）。"""
+    stack = await _build_agent("ask", model_ref, root, godot_root)
+    session = stack.session
+    stack.loop.bus = EventBus()
+    bus = stack.loop.bus
+    mode = "ask"
+    mcp = McpManager(stack.dispatcher.registry)
+    await mcp.start_all()
+    await _run_hook(stack.hooks, "session_start", session)
+    pending: str | None = initial
+    try:
+        consumer = asyncio.create_task(_render_events(bus))
+        print("\n[chat] 输入 /help 看命令，exit / quit 退出"
+              f"（session={session.session_id}）")
+        while True:
+            if pending is None:
+                pending = await asyncio.to_thread(input, "\n你> ")
+            text = (pending or "").strip()
+            pending = None
+            if not text:
+                continue
+            if text.lower() in ("exit", "quit", "/exit", "/quit"):
+                break
+            if stack.commands.parser.is_command(text):
+                cmd_result = await stack.commands.dispatch(text, stack.ctx)
+                mode, nxt = await _apply_command_result(cmd_result, stack, mode)
+                if nxt is None:
+                    continue                       # 命令已完结（清单/状态变更）
+                text = nxt
+            await _run_turn(stack, text, mode)
+        await bus.close()
+        await consumer
+    finally:
+        await _run_hook(stack.hooks, "session_end", session)
+        await stack.hooks.join_background(timeout=5.0)
+        await mcp.stop_all()
+        _save_grants(stack.manager, session.session_id, stack.rules)
+    print(f"\n[结束] session={session.session_id}")
 
 
 async def run_resume(session_id: str | None, model_ref: str | None,
@@ -174,15 +334,21 @@ async def run_resume(session_id: str | None, model_ref: str | None,
     from agent_godot.permission.confirm import resume_batch
     from agent_godot.session import SessionState
 
-    llm, loop, dispatcher, manager, _, rules = await _build_agent(
-        "ask", model_ref, root, godot_root, create_session=False)
+    stack = await _build_agent("ask", model_ref, root, godot_root,
+                               create_session=False)
+    loop, dispatcher, manager, rules = (stack.loop, stack.dispatcher,
+                                        stack.manager, stack.rules)
     loop.bus = EventBus()
     bus = loop.bus
 
     session = await (manager.resume(session_id) if session_id
                      else manager.resume_latest())
-    dispatcher.gate.session = session    # 确认门重绑到恢复的会话
+    # 恢复的会话要重新绑到所有持有会话引用的地方（门 / hook 现场 / 命令上下文）
+    dispatcher.gate.session = session    # 确认门重绑（门禁 hook 拿的是同一个 gate）
+    dispatcher.session = session
     dispatcher.on_result = _make_recorder(session)
+    stack.session = session
+    stack.ctx.session = session
     print(f"[resume] 会话 {session.session_id} 状态: {session.state.value}"
           f"（{session.turns()} 轮）")
     # 恢复会话级授权记忆（"本次会话不再问"跨重启不丢）
@@ -190,6 +356,8 @@ async def run_resume(session_id: str | None, model_ref: str | None,
 
     mcp = McpManager(dispatcher.registry)
     await mcp.start_all()
+    await _run_hook(stack.hooks, "session_start", session)
+    mode = "ask"
     try:
         consumer = asyncio.create_task(_render_events(bus))
         if session.state is SessionState.WAITING_CONFIRM:
@@ -206,14 +374,24 @@ async def run_resume(session_id: str | None, model_ref: str | None,
             result = await loop.continue_with(session, done)
         else:
             # 续聊：纪要已在事件流里，直接以新输入驱动（L3 会话级恢复）
-            question = await asyncio.to_thread(input, "[resume] 继续对话（输入内容）: ")
-            result = await loop.run(session, question)
+            question = await asyncio.to_thread(
+                input, "[resume] 继续对话（输入内容）: ")
+            question = (question or "").strip()
+            if stack.commands.parser.is_command(question):
+                cmd_result = await stack.commands.dispatch(question, stack.ctx)
+                mode, question = await _apply_command_result(cmd_result, stack,
+                                                             mode)
+            result = (await _run_turn(stack, question, mode)
+                      if question else None)
         await bus.close()
         await consumer
     finally:
+        await _run_hook(stack.hooks, "session_end", session)
+        await stack.hooks.join_background(timeout=5.0)
         await mcp.stop_all()
         _save_grants(manager, session.session_id, rules)
-    print(f"\n[结束] stop_reason={result.stop_reason} steps={result.steps}")
+    if result is not None:
+        print(f"\n[结束] stop_reason={result.stop_reason} steps={result.steps}")
 
 
 def _grants_path(manager, session_id: str) -> Path:
@@ -350,6 +528,13 @@ def main() -> None:
     craft.add_argument("--root", default=None, help="工具沙箱的项目根目录")
     craft.add_argument("--godot-root", default=None, help="Godot 项目根")
 
+    chat = sub.add_parser("chat", help="交互式会话（M14：斜杠命令 + 对话双入口）")
+    chat.add_argument("question", nargs="*", default=None,
+                      help="可选的首句输入（不给则直接进入交互）")
+    chat.add_argument("--model", default=None, help="模型引用覆盖")
+    chat.add_argument("--root", default=None, help="工具沙箱的项目根目录")
+    chat.add_argument("--godot-root", default=None, help="Godot 项目根")
+
     resume = sub.add_parser("resume", help="恢复会话（M09：确认门续跑 / 续聊）")
     resume.add_argument("session_id", nargs="?", default=None,
                         help="会话 ID（默认最近一个）")
@@ -378,6 +563,11 @@ def main() -> None:
         godot_root = Path(args.godot_root).resolve() if args.godot_root else None
         asyncio.run(run_ask(" ".join(args.question), mode, args.model,
                             root, godot_root))
+    elif args.command == "chat":
+        root = Path(args.root).resolve() if args.root else None
+        godot_root = Path(args.godot_root).resolve() if args.godot_root else None
+        initial = " ".join(args.question).strip() or None
+        asyncio.run(run_chat(initial, args.model, root, godot_root))
     elif args.command == "resume":
         root = Path(args.root).resolve() if args.root else None
         godot_root = Path(args.godot_root).resolve() if args.godot_root else None
