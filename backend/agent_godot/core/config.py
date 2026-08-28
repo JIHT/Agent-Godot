@@ -46,6 +46,11 @@ class RouteRule:
 class ModelRegistry:
     """models.yaml 的运行时镜像。一个进程一个实例即可（load_registry 工厂）。"""
 
+    # 已知小模型任务角色（文档锚点）：routing 键不受此限——任何键都是
+    # 合法角色，未配置的自动回落 ask 主 LLM（"默认主 LLM，可自行配置"）。
+    TASK_ROLES = ("intent", "rewrite", "hyde", "compress", "memory",
+                  "graph_extract")
+
     def __init__(self, data: dict, source: Path):
         self._source = source
         self._providers: dict[str, dict] = data.get("providers") or {}
@@ -142,6 +147,16 @@ class ModelRegistry:
             max_tokens=rule.get("max_tokens"),
         )
 
+    def task_rule(self, task: str) -> RouteRule:
+        """小模型场景的路由规则：routing.<task>（如 intent/rewrite/hyde/
+        compress/memory/graph_extract）。
+
+        纪律：未配置的任务角色回落 ask（主 LLM）——默认都是主 LLM，
+        用户在 models.yaml 里给具体场景配了键才单独走。route() 的
+        ask 回退天然实现这一点，这里只做语义显式化与文档锚定。
+        """
+        return self.route(task)
+
     # ---------- 便捷出口 ----------
 
     def llm(self, ref: str):
@@ -151,6 +166,14 @@ class ModelRegistry:
     def llm_for_mode(self, mode: str):
         """按模式取适配器实例（craft 用稳模型、ask 用活模型……全在 yaml 定）。"""
         return self.llm(self.route(mode).ref)
+
+    def llm_for_task(self, task: str):
+        """按任务角色取适配器实例：registry.llm_for_task("intent")。
+
+        小模型场景统一入口——models.yaml 的 routing 里配了同名键就用
+        它，没配就用 ask 主 LLM（用户可控的"小模型自由配置"）。
+        """
+        return self.llm(self.task_rule(task).ref)
 
     # ---------- LM Studio / Ollama 模型发现 ----------
 
@@ -188,6 +211,9 @@ class ModelRegistry:
         for mode, rule in self._routing.items():
             lines.append(f"  {mode:8s} → {rule.get('ref')}"
                          f" (T={rule.get('temperature')})")
+        configured = [r for r in self.TASK_ROLES if r in self._routing]
+        lines.append(f"  （小模型角色未配置的回落 ask；已单独配置: "
+                     f"{', '.join(configured) if configured else '无'}）")
         return "\n".join(lines)
 
 

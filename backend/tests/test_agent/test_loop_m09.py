@@ -85,7 +85,9 @@ async def test_loop_with_confirm_gate_events_persisted(tmp_path: Path):
         [text_ev("两步都完成了"), done_ev(None, "stop")],
     ]
     loop = AgentLoop(FakeLLM(script), dispatcher, model="m")
-    result = await loop.run(session, "干活")
+    # M13：默认 ask 模式只读（写工具被 tools_view 物理过滤），确认门测试需写工具，
+    # 故显式用 craft（全工具 + 无验证器时 VerifyLoop 自动跳过）。
+    result = await loop.run(session, "干活", mode="craft")
     assert result.stop_reason == "natural"
     assert target.read_text(encoding="utf-8") == "x\n"      # 批准后恰好执行一次
 

@@ -59,6 +59,20 @@ async def _cli_prompter(pc):
     return ConfirmAnswer(approved=True, remember="session")
 
 
+async def _cli_plan_approver(plan_text: str) -> bool:
+    """CLI 计划审批（M13 plan 模式的任务级 HITL）：出示 DAG 等业主签字。"""
+
+    def ask() -> bool:
+        print("\n[计划审批]\n" + plan_text)
+        while True:
+            a = input("批准执行? [y=批准 / n=拒绝] ").strip().lower()
+            if a in ("y", "n"):
+                return a == "y"
+            print("请输入 y / n")
+
+    return await asyncio.to_thread(ask)
+
+
 def _make_recorder(session):
     """dispatcher.on_result 钩子：单调用完成即 ToolDone 事件落盘（M09 §3）。"""
     from agent_godot.core import Message
@@ -89,9 +103,10 @@ async def _build_agent(question_mode: str, model_ref: str | None,
     base_root = root or Path.cwd()
     project_root = godot_root or (
         base_root if (base_root / "project.godot").exists() else None)
+    godot_ctx = None
     if project_root:
         from agent_godot.tools.godot import register_godot_tools
-        register_godot_tools(reg, project_root)
+        godot_ctx = register_godot_tools(reg, project_root)
         print(f"[godot] 领域工具已接入（项目根: {project_root}）")
 
     # M09 权限门：permissions.yaml 找不到就用内置默认（low=allow/其余 ask）
@@ -119,7 +134,8 @@ async def _build_agent(question_mode: str, model_ref: str | None,
         config=BudgetConfig(),
         history=HistoryManager(counter),
         model=model_name)
-    loop = AgentLoop(llm, dispatcher, model=model_name, bus=None, context=context)
+    loop = AgentLoop(llm, dispatcher, model=model_name, bus=None, context=context,
+                     verify_runner=godot_ctx.runner if godot_ctx else None)
     return llm, loop, dispatcher, manager, session, rules
 
 
@@ -135,7 +151,14 @@ async def run_ask(question: str, mode: str, model_ref: str | None,
     await mcp.start_all()
     try:
         consumer = asyncio.create_task(_render_events(bus))
-        result = await loop.run(session, question, mode=mode)
+        if mode == "plan":
+            # plan 模式走 DAG 外循环（生成计划 → 人审批 → 拓扑执行 → re-plan）
+            from agent_godot.agent.paradigms import PlanStrategy
+            strategy = PlanStrategy(llm=llm, loop=loop,
+                                    approver=_cli_plan_approver)
+            result = await strategy.run_plan_mode(session, question)
+        else:
+            result = await loop.run(session, question, mode=mode)
         await bus.close()
         await consumer
     finally:

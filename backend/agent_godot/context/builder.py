@@ -1,7 +1,7 @@
 """context/builder.py —— 分区预算 + 贪心降级总装（M07 §1.2 / §4 步骤 4）
 
 每轮开始前把书桌整理成"此刻最该看的东西"：
-  算预算（窗口 - 输出保留 - tools 实测）→ 组装四分区（带优先级）
+  算预算（窗口 - 输出保留 - tools 实测）→ 组装五分区（带优先级）
   → while 超预算：取最高可压优先级分区 downgrade → assemble 按序拼装。
 
 降级链（先压最不痛的）：history A档占位 → B档模板摘要 → C档LLM摘要
@@ -23,6 +23,10 @@ from .truncator import ObservationTruncator
 # M08：记忆注入回调——async (session) -> list[Message]
 # 由 memory.make_memory_provider(retriever, project_id) 构造，None=不注入
 MemoryProvider = Callable[[Any], Awaitable["list[Message] | None"]]
+
+# M12：检索注入回调（与 MemoryProvider 同形）——
+# 由 query_engine.rag_messages(result) 包一层构造，None=不注入
+RagProvider = MemoryProvider
 
 
 class ContextOverflowError(Exception):
@@ -64,7 +68,8 @@ class ContextBuilder:
                  history: HistoryManager | None = None,
                  truncator: ObservationTruncator | None = None,
                  model: str = "",
-                 memory_provider: MemoryProvider | None = None):
+                 memory_provider: MemoryProvider | None = None,
+                 rag_provider: RagProvider | None = None):
         self.counter = counter or TokenCounter()
         self.compressor = compressor or Compressor()
         self.config = config or BudgetConfig()
@@ -72,6 +77,7 @@ class ContextBuilder:
         self.truncator = truncator or ObservationTruncator()
         self.model = model                 # 临界精算用
         self.memory_provider = memory_provider   # M08 记忆注入回调（None=不注入）
+        self.rag_provider = rag_provider         # M12 检索注入回调（None=不注入）
         self._layout: dict[str, int] = {}
         self._last_estimate = 0            # 上轮请求的估算值（calibrate 对账用）
 
@@ -92,12 +98,13 @@ class ContextBuilder:
         parts = [
             Partition("system", system_msgs, priority=0),      # 不可压
             Partition("memory", [], priority=1),               # M08 注入位（可丢）
+            Partition("rag", [], priority=1),                  # M12 注入位（可丢）
             Partition("history", history, priority=2),         # 可压可丢
             Partition("latest", latest, priority=0),           # 不可压（工作记忆）
         ]
         # 历史先过保留配对滑窗（软上限 = 可用预算 × history_share）
         hist_cap = int(budget * cfg.history_share)
-        parts[2].content = self.history.rolling(history, max_tokens=hist_cap)
+        parts[3].content = self.history.rolling(history, max_tokens=hist_cap)
 
         # M08：记忆分区注入（可丢——降级链优先级 1，预算紧时第一个被丢弃）
         if self.memory_provider is not None and not parts[1].content:
@@ -106,6 +113,15 @@ class ContextBuilder:
                 parts[1].content = memory_msgs or []
             except Exception:                       # noqa: BLE001 —— 记忆不可拖垮主流程
                 parts[1].content = []
+
+        # M12：检索分区注入（本问最相关的证据，可丢但排在 memory 之后丢——
+        # 分区列表序决定同级优先级：memory 先被牺牲，rag 保到最后）
+        if self.rag_provider is not None and not parts[2].content:
+            try:
+                rag_msgs = await self.rag_provider(session)
+                parts[2].content = rag_msgs or []
+            except Exception:                       # noqa: BLE001 —— 检索不可拖垮主流程
+                parts[2].content = []
 
         used = self._refresh(parts)
 
@@ -121,7 +137,7 @@ class ContextBuilder:
 
         # ---- 最后兜底：latest 的肥 Observation 做 L1 截断 ----
         if used > budget:
-            self._truncate_latest(parts[3], budget - (used - parts[3].tokens))
+            self._truncate_latest(parts[4], budget - (used - parts[4].tokens))
             used = self._refresh(parts)
 
         # ---- 临界精算：估算贴近预算线 ±500 时 tiktoken 复核 ----
@@ -189,7 +205,7 @@ class ContextBuilder:
         return sum(p.tokens for p in parts)
 
     def _assemble(self, parts: list[Partition]) -> list[Message]:
-        """system → memory → history → latest（首尾高召回，中间低价值区）。"""
+        """system → memory → rag → history → latest（首尾高召回，中间低价值区）。"""
         out: list[Message] = []
         for p in parts:
             out.extend(p.content)
@@ -209,7 +225,7 @@ class ContextBuilder:
     def _next_level(self, part: Partition) -> int | None:
         if part.name == "history":
             return part.level + 1 if part.level < 3 else None
-        if part.name == "memory":
+        if part.name in ("memory", "rag"):     # 两个注入位：可整体丢（M08/M12）
             return 1 if part.level == 0 else None
         return None
 
@@ -233,7 +249,7 @@ class ContextBuilder:
                     [m for m in part.content if not self.history.is_pinned(m)],
                     budget=budget)
                 part.content = [summary, *pinned]
-        elif part.name == "memory":        # 记忆分区可整体丢（M08 兜底可召回）
+        elif part.name in ("memory", "rag"):    # 两个注入位可整体丢（兜底可召回/可重查）
             part.content = []
 
     def _pinned_of(self, part: Partition) -> list[Message]:
@@ -258,4 +274,4 @@ class ContextBuilder:
 
 # HistoryConfig 重导出（builder 的常用伴手）
 __all__ = ["BudgetConfig", "ContextBuilder", "ContextOverflowError",
-           "HistoryConfig", "Partition"]
+           "HistoryConfig", "Partition", "RagProvider"]

@@ -76,10 +76,6 @@ providers:
   #   model: Qwen/Qwen2.5-Coder-7B-Instruct
   #   api_key: dummy                 # vLLM 默认不校验
 
-# ---------- 模式路由：四模式各用哪个模型（M13 消费）----------
-# craft 改代码要稳（低温+本地/强模型）、ask 聊天要活（高温）
-# 换默认模型 = 改这几行字符串，代码零改动
-
 # ---------- 嵌入服务（M02 语义缓存 / M10 RAG / M08 记忆共用的度量衡）----------
 # 一个模型一个相似度空间：换模型 = 重建全部索引与缓存（M10 铁律）。
 # 铁律由 SemanticCache._guard_dim 自动执行：维度漂移 → 缓存全量失效。
@@ -104,3 +100,23 @@ routing:
   multi:
     ref: deepseek/deepseek-chat
     temperature: 0.3
+
+  # ---------- 小模型场景（M12 起）----------
+  # routing 表的键不止上面四种模式：任何键都是"任务角色"（task role）。
+  # 纪律：未配置的角色一律回落 ask 主 LLM —— "默认都是主 LLM，
+  # 用户想给某个场景单独换便宜/更快的小模型时再解开注释改 ref"。
+  # 代码侧入口：registry.llm_for_task("intent") / registry.task_rule("rewrite")。
+  #
+  # 已知角色（M12 消费前三个，其余各模块陆续接）：
+  #   intent          M12 意图分类（few-shot，要稳：temperature 0）
+  #   rewrite         M12 查询改写（指代消解）
+  #   hyde            M12 假想文档生成（可选开关）
+  #   compress        M07 历史压缩 C 档摘要（廉价模型即可）
+  #   memory          M08 记忆洞察抽取
+  #   graph_extract   M11 文档→三元组抽取
+  #
+  # 例：把意图分类指到便宜小模型（deepseek-chat 本身就是好的小模型）：
+  # intent:
+  #   ref: deepseek/deepseek-chat
+  #   temperature: 0.0
+  #   max_tokens: 16
