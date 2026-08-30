@@ -99,7 +99,7 @@ class SubtaskResult:
 class SubagentSpec:
     """子代理合同四要素（§1.2 ①）：角色提示 + 工具视图 + 模型档位 + 预算。
 
-    remote：A2A 远程执行器（M15 §1.4）。非 None 时 spawn 走 HTTP 而非本地
+    remote：A2A 远程执行器（M15 §1.5）。非 None 时 spawn 走 HTTP 而非本地
     Loop——同一个 SubtaskResult 出口，编排层分不出本地工人和外包工人（Adapter）。
     """
 

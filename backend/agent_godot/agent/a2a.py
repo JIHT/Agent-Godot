@@ -1,4 +1,4 @@
-"""agent/a2a.py —— A2A 客户端：把外部 Agent 服务当"远程工人"派活（M15 §1.4）
+"""agent/a2a.py —— A2A 客户端：把外部 Agent 服务当"远程工人"派活（M15 §1.5）
 
 Agent2Agent（Google 2025，Linux 基金会）：独立 Agent 服务间的互操作协议。
 与 MCP 的分界（§2 问答 6）在交互对象的**自主性**：
@@ -6,7 +6,7 @@ Agent2Agent（Google 2025，Linux 基金会）：独立 Agent 服务间的互操
     A2A = 代理级互操作（"把这面墙砌了"：接任务后自己规划，可能反问）
 两者分层而非竞争——一个 A2A Agent 内部完全可能用 MCP 调工具。
 
-三要素（§1.4 ①）：
+三要素（§1.5 ①）：
   ① Agent Card：/.well-known/agent.json —— 自描述名片（会干什么/找谁/怎么签合同）
   ② Task 生命周期：submitted → working → input-required → completed / failed
   ③ Artifact：任务产物（文本/文件/结构化数据）
@@ -15,7 +15,7 @@ Agent2Agent（Google 2025，Linux 基金会）：独立 Agent 服务间的互操
 补充"，任务挂起。本协议层的挂起在这里**适配成本地确认门事件**——无论工人是
 进程内还是远程，用户看到的都是同一个确认弹层（协议适配归 adapter，体验归产品）。
 
-★ 不可信边界（§1.4 易错点）：任务书里不放密钥/内部绝对路径；产出物落地前过
+★ 不可信边界（§1.5 易错点）：任务书里不放密钥/内部绝对路径；产出物落地前过
 验证。远程调用一律配超时（本地子代理秒级，远程分钟级——预算不是一个量级）。
 
 最小可用子集（card 发现 + message/send + tasks/get 轮询）；SSE 订阅
@@ -83,7 +83,7 @@ class AgentCard:
 
     @property
     def signature(self) -> str:
-        """能力指纹（版本变了要重发现——§1.4 易错点③）。"""
+        """能力指纹（版本变了要重发现——§1.5 易错点③）。"""
         return f"{self.name}@{self.version or '0'}"
 
     def describe(self) -> str:
@@ -162,7 +162,7 @@ class A2AClient:
     async def discover(self, base_url: str, force: bool = False) -> AgentCard:
         """拉 /.well-known/agent.json（带 TTL 缓存）。
 
-        缓存与失效（§1.4 易错点③）：对方能力变了不会通知我，所以缓存必须
+        缓存与失效（§1.5 易错点③）：对方能力变了不会通知我，所以缓存必须
         有寿命——TTL 内直接复用（省一次往返），过期或 force=True 时重发现。
         重发现拿到新 card 后比对 version：变了就是能力漂移，记录一条事件
         （编排层据此决定是否重新拆解任务书）。
@@ -192,7 +192,7 @@ class A2AClient:
     # ---------- 派活与轮询 ----------
 
     async def send_task(self, card: AgentCard, text: str) -> str:
-        """message/send → taskId（§1.4 ③）。"""
+        """message/send → taskId（§1.5 ③）。"""
         payload = self._envelope("message/send", {"message": {
             "role": "user",
             "parts": [{"kind": "text", "text": text}]}})
@@ -234,7 +234,7 @@ class A2AClient:
                          budget: Budget | None = None) -> SubagentSpec:
         """把 Agent Card 包装成子代理（run 时走 HTTP 而非本地 Loop）。
 
-        这就是 §1.4 说的"又一个 Adapter 实战"：Orchestrator 分不出本地工人与
+        这就是 §1.5 说的"又一个 Adapter 实战"：Orchestrator 分不出本地工人与
         外包工人——两边都吐 SubtaskResult，聚合管线零改动。
         """
         spec_name = name or f"a2a:{card.name}"
