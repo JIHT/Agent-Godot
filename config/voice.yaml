@@ -1,0 +1,145 @@
+# config/voice.yaml —— 语音模块配置面（M16 §9.5，遵循 M23 三层兜底）
+#
+# 优先级：环境变量 > 本文件 > 代码内默认值（voice/config.py 的 dataclass 字段）
+# 纪律：本文件只写"想覆盖的项"，删掉任何一项系统照常跑（代码里有默认值）。
+# 魔法数一律注明来源，出处可追溯（§1.2 ⑤）。
+
+asr:
+  # ── 中文路径：SenseVoice-Small（234M / Apache 2.0 / 可商用）──────────
+  # 为什么不是 whisper：whisper large-v3 中文 AISHELL-1 CER 5.14%，
+  # 会议场景高达 18.87%（每五个字错一个）；SenseVoice 约 3.0%，且 10 秒
+  # 音频只要 70ms（比 Whisper-Large 快 15 倍）。
+  #
+  # 附带白送两项能力（复用同一次 ASR 调用，边际成本≈0）：
+  #   · 情感识别  HAPPY / SAD / ANGRY / NEUTRAL / FEARFUL / DISGUSTED / SURPRISED
+  #   · 音频事件  BGM / Applause / Laughter / Cough / Sneeze / Breath / Cry
+  # 对"口语诊断"是降维打击——原方案三个维度全在文本层，副语言层是空的，
+  # 而面试官最在意的紧张度/自信度恰恰藏在韵律里，文本看不出来。
+  #
+  # 精度再高一档可选 firered2-aed（AISHELL-1 CER 0.57%），但需 GPU、无流式、
+  # 无情感；日常用 SenseVoice 的综合性价比更高。
+  default: sensevoice
+  routing:
+    zh: sensevoice        # 普通话
+    yue: sensevoice       # 粤语（SenseVoice 明确支持）
+    ja: sensevoice
+    ko: sensevoice
+    en: whisper           # 英文仍是 whisper 主场
+    default: sensevoice
+  # 高精度路由（离线诊断报告用，Transcriber.transcribe(high_accuracy=True) 时生效）
+  quality_routing:
+    zh: sensevoice        # 想要极限精度改 firered2-aed
+    default: whisper
+
+  # 引擎参数表：key 是引擎名，value 直传后端（未列出的键用后端默认值）
+  engines:
+    sensevoice:
+      model: iic/SenseVoiceSmall
+      device: cuda:0
+      # ★ SenseVoice 单次只吃 ≤30s 音频，长音频必须挂 FunASR 的 VAD 切段。
+      #   不配的话 3 分钟录音会直接报错或只转前 30 秒。
+      vad_model: fsmn-vad
+      vad_kwargs:
+        max_single_segment_time: 30000
+      # ★ SenseVoice 输出不带标点，挂 ct-punc 补回来。
+      #   不补的话 §1.2 的停顿判断与 LLM 读到的转写都是一坨连读。
+      punc_model: ct-punc
+      output_timestamp: true    # 出字级时间戳（毫秒）——§1.2 全部指标的地基
+      ban_emo_unk: false        # 允许输出 NEUTRAL 之外的情感标签
+      merge_vad: true           # VAD 切段后合并回连续结果
+      merge_length_s: 15        # 合并后的段长上限（秒）
+
+    whisper:
+      model_size: large-v3-turbo
+      device: auto
+      compute_type: default
+    qwen3-asr-0.6b:
+      model: Qwen/Qwen3-ASR-0.6B
+      device: cuda:0
+    firered2-aed:
+      model: FireRedTeam/FireRedASR2-AED
+      device: cuda:0
+    remote:
+      base_url: http://127.0.0.1:8001
+
+  # 热词：Godot 生态专有名词，不注入必错（§9.2 缺口 6）
+  hotwords: [Godot, GDScript, Tween, Node2D, CharacterBody2D, player.gd]
+
+  # 幻觉三防（§1.1 ⑤c）
+  condition_on_previous_text: false     # 切断跨段幻觉传播
+  hallucination_silence_threshold: 2.0  # 需 word_timestamps=true
+  word_timestamps: true
+  language: null                        # null = 自动检测（语速单位依赖它，见 §1.1 ⑤b）
+  min_language_prob: 0.5                # 低于此值报"语言不确定"
+  timeout_s: 600                        # 转写是分钟级长任务
+  max_retries: 2                        # M02 韧性管道第四次复用
+
+vad:
+  backend: auto                         # silero | energy | auto（无 torch 时自动回落 energy）
+  threshold: 0.5
+  min_speech_ms: 250                    # 短于此时长的段丢弃（防咳嗽误触发）
+  min_silence_ms: 500                   # 静音超此时长才切段（官方默认 2000 太钝）
+  speech_pad_ms: 200                    # 段前后各补（官方默认 400）
+
+preprocess:
+  enabled: true
+  target_sr: 16000
+  loudnorm: true
+  target_lufs: -16.0                    # EBU R128；VAD/ASR 对音量敏感
+  highpass_hz: 60                       # 去 DC 与低频轰鸣
+
+align:
+  enabled: true                         # wav2vec2 CTC 强制对齐，失败自动回退（§9.2 缺口 2）
+  beam_width: 2
+  fallback_to_asr: true                 # 对齐失败时回退原始时间戳，管线不断
+
+normalize:
+  itn: true                             # 中文数字→阿拉伯数字（直接影响力语速分子 §1.2 ⑤）
+  restore_punctuation: false            # whisper 自带标点；国产部分引擎需开
+  punc_gap_s: 0.6                       # 按间隙补句末标点的阈值
+  redact_pii: true                      # 落库前脱敏（§9.2 缺口 15）
+
+diarize:
+  enabled: false                        # 会议场景才开；单人口语诊断不必付这份算力
+  backend: cam++                        # 中文 cam++ / 英文 pyannote-3.1
+  # 隐私红线：只出 SPEAKER_00 编号，绝不做声纹身份识别（§9.2 不采纳项）
+
+features:
+  pause_thinking_s: 0.8                 # 来源：中文口语研究常用阈值
+  pause_stuck_s: 2.0
+  filler_words: [就是, 然后, 那个, 嗯, 呃, 这个, 啊, 的话, like, um, uh, you know]
+  filler_normal_rate: [0.05, 0.08]      # 中文口语正常区间
+  quote_exempt: true                    # 引述语境豁免（"他说'那个'一词"不算）
+  rhythm_window: 10                     # 节奏方差滑窗（词数）
+  en_word_to_zh_char: 1.5               # 混说折算系数（经验值：210/150≈1.4，取 1.5）
+  speech_rate_ref:
+    zh: {unit: 字/分, slow: 140, normal: [180, 240], fast: 300}
+    en: {unit: 词/分, slow: 110, normal: [130, 170], fast: 190}
+
+diagnose:
+  enabled: true
+  max_transcript_chars: 12000           # 超长转写分段诊断（§1.3 ⑤）
+
+tts:
+  default: edge-tts                     # 装了 qwen-tts 后改成 qwen3-tts-0.6b（97ms 流式）
+  voice: zh-CN-XiaoxiaoNeural
+  rate: "+0%"
+  sample_rate: 24000                    # ★ 合成/播放/录音三处必须一致（§1.4 ⑤）
+  sentence_max_chars: 18                # 长度兜底强制切，防长句饿死首音
+  code_symbol_pronunciation: true       # player.gd → "player dot G D"
+
+realtime:
+  semantic_endpoint: false              # 开 true 需装 smart-turn（§9.2 缺口 10）
+  endpoint_silence_ms: 500
+  min_utterance_ms: 250
+  barge_in_ms: 200
+  asr_policy: localagreement            # localagreement | alignatt
+  min_chunk_s: 1.0
+  max_context_chars: 4000
+
+privacy:
+  keep_audio: false                     # 录音不落库，只存转写与特征（§1.3）
+  retain_days: 7
+
+metrics:
+  enabled: true                         # RTF / TTFA / VAD 裁剪率 / 幻觉率 / CER

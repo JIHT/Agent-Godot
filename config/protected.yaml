@@ -1,0 +1,37 @@
+# M15 受保护文件名单（protected.yaml）—— 编排层的"承重墙"清单
+#
+# 两个子任务争抢这些文件时，**不许由编排层自己决定**怎么处置（处置 #3 上抛用户）。
+# 命中方式三种，任一命中即视为受保护：
+#   - 精确/前缀：`project.godot` 命中它本身与其目录下的后代路径
+#   - 目录：`migrations/**` 这种带尾 `/**` 的写法命中该目录下任意深度
+#   - glob：`*.lock` 命中任意层级的同名后缀（fnmatch 语义，* 可跨 `/`）
+#
+# 为什么这些是承重墙：入口与打包配置（project.godot / export_presets.cfg）改坏
+# 整个项目起不来；锁文件（uv.lock）改坏依赖不可复现；migration 改坏数据回不去；
+# .agent_godot 是 Agent 自己的状态区（被并行改写会丢检查点与记忆）。
+#
+# on_protected：ask | serialize | abort
+#   ask       —— 交互式默认：弹确认门，用户说了算
+#   serialize —— 自动退回串行（不打断流程，适合可信场景）
+#   abort     —— 直接不派发（CI / A2A 无人值守会被**强制**降级为 abort，
+#                因为没人应答的确认门等于永久挂起）
+
+on_protected: ask
+
+protected:
+  # Godot 项目入口与打包配置
+  - project.godot
+  - export_presets.cfg
+  - "*.godot"
+
+  # 依赖锁文件（改坏 = 环境不可复现）
+  - uv.lock
+  - poetry.lock
+  - package-lock.json
+  - "*.lock"
+
+  # 数据迁移（改坏 = 数据回不去）
+  - "migrations/**"
+
+  # Agent 自身状态区（并行改写会丢检查点/记忆）
+  - ".agent_godot/**"
