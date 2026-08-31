@@ -222,6 +222,19 @@ def _make_model_switcher(stack: AgentStack, registry):
     return switch
 
 
+def _cli_orchestrator_approver(question: str, conflict) -> bool:
+    """编排层确认门（§1.4 处置 #3）：受保护文件的处置**人说了算**。
+
+    与其它确认门共用同一个终端交互（无论工人是进程内还是远程、是工具级还是
+    编排级，用户看到的都是同一个"要不要放行"的提问——协议适配归 adapter）。
+    """
+    try:
+        answer = input(f"\n[编排确认门] {question}\n放行? (y/N): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    return answer in ("y", "yes")
+
+
 async def _run_hook(hooks, point: str, session, **extra) -> None:
     """session_start / session_end：会话级挂载点（veto 在这两个点没有语义）。"""
     if hooks is None or not hooks.has(point):
@@ -241,12 +254,18 @@ async def _run_turn(stack: AgentStack, text: str, mode: str):
                                 approver=_cli_plan_approver)
         return await strategy.run_plan_mode(stack.session, text)
     if mode == "multi":
-        # M15：Orchestrator 拆活 → 冲突分组 → 并发派生子代理 → 聚合交付
+        # M15：Orchestrator 拆活 → 冲突判定/决策树 → 并发派生子代理 → 聚合交付
+        # 项目根与检查点传进去：受保护名单、大小写折叠、CONSTRAINTS 加载、
+        # task 级快照（可回滚）都需要它（§1.4 ⑥-8 / §1.6 ⑥-4）
         from agent_godot.agent.paradigms import MultiStrategy
         strategy = MultiStrategy(llm=stack.llm, loop=stack.loop,
                                  registry=stack.dispatcher.registry,
                                  bus=stack.loop.bus,
-                                 specs=stack.ctx.extra.get("subagent_specs"))
+                                 specs=stack.ctx.extra.get("subagent_specs"),
+                                 project_root=stack.root,
+                                 checkpoints=getattr(stack.manager,
+                                                     "checkpoints", None),
+                                 approver=_cli_orchestrator_approver)
         return await strategy.run_multi_mode(stack.session, text)
     return await stack.loop.run(stack.session, text, mode=mode)
 
@@ -457,6 +476,11 @@ async def _render_events(bus: EventBus) -> None:
                   f"分 {len(p.get('groups', []))} 组（组间并行/组内串行）")
             for i, g in enumerate(p.get("groups", []), 1):
                 print(f"  第{i}组: {' → '.join(g)}")
+        elif t == "orchestrator_warn":           # M15 §1.4：判定告警（可观测）
+            print(f"\n[编排告警] {p.get('kind')}: {p.get('detail')}")
+        elif t == "orchestrator_escalation":     # M15 §1.4：受保护文件上抛
+            verdict = "已放行" if p.get("allowed") else "**已拦截**"
+            print(f"\n[编排确认门] {p.get('question')}\n  → {verdict}")
         elif t == "subtask_start":
             targets = p.get("write_targets") or []
             suffix = f"（写目标: {', '.join(targets)}）" if targets else ""
@@ -553,6 +577,184 @@ async def run_checkpoint(action: str, name: str, root: Path | None) -> None:
                   f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(info['ts']))}）")
 
 
+# ── M16 语音子命令（voice transcribe / analyze / chat）──────────────────
+
+class _WavSink:
+    """把收到的 TTS 音频块攒成 WAV 文件（服务端没有扬声器，播放归 M20 前端）。
+
+    aflush 是 realtime.py 约定的打断协议：打断时清空未播块。
+    """
+
+    def __init__(self, path: Path, sample_rate: int) -> None:
+        self.path, self.sr = path, sample_rate
+        self.frames: list[bytes] = []
+
+    def __call__(self, chunk) -> None:
+        if chunk.audio:
+            self.frames.append(chunk.audio)
+
+    def aflush(self) -> None:
+        self.frames.clear()                    # 打断：丢弃未播块
+
+    def save(self) -> int:
+        import wave
+
+        data = b"".join(self.frames)
+        if not data:
+            return 0
+        with wave.open(str(self.path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.sr)
+            w.writeframes(data)
+        return len(data)
+
+
+async def run_voice_transcribe(path: str, lang: str, fmt: str,
+                               high_accuracy: bool) -> None:
+    """voice transcribe —— 音频 → 带时间戳转写（可导出 srt/vtt/json）。"""
+    from agent_godot.voice.config import load_voice_config
+    from agent_godot.voice.export import to_json, to_srt, to_vtt
+    from agent_godot.voice.features import extract_features
+    from agent_godot.voice.normalize import redact_result
+    from agent_godot.voice.stt import Transcriber
+
+    cfg = load_voice_config()
+    p = Path(path)
+    if not p.exists():
+        print(f"音频不存在: {p}")
+        return
+    tr = await Transcriber(cfg).transcribe(p, lang=lang or None,
+                                           high_accuracy=high_accuracy)
+    warn = tr.axis_warning()
+    if warn:
+        print(f"⚠ {warn}")
+
+    safe = redact_result(tr)
+    if fmt == "srt":
+        print(to_srt(safe))
+    elif fmt == "vtt":
+        print(to_vtt(safe))
+    elif fmt == "json":
+        print(to_json(safe, extract_features(tr, cfg.features)))
+    else:
+        print(f"引擎 {tr.provenance.engine} · 语言 {tr.language}"
+              f"（置信度 {tr.provenance.language_prob:.2f}）· "
+              f"时长 {tr.duration:.1f}s · 已对齐={tr.provenance.aligned}"
+              f"{' · ⚠含低置信片段' if tr.low_confidence else ''}")
+        print()
+        print(safe.text)
+
+
+async def run_voice_analyze(path: str, lang: str, with_report: bool) -> None:
+    """voice analyze —— 录音 → 特征 + LLM 诊断报告。"""
+    from agent_godot.voice.config import load_voice_config
+    from agent_godot.voice.diagnose import diagnose, verify_no_number_drift
+    from agent_godot.voice.features import extract_features, to_diagnosis_input
+    from agent_godot.voice.stt import Transcriber
+
+    cfg = load_voice_config()
+    p = Path(path)
+    if not p.exists():
+        print(f"音频不存在: {p}")
+        return
+
+    tr = await Transcriber(cfg).transcribe(p, lang=lang or None, high_accuracy=True)
+    if (w := tr.axis_warning()):
+        print(f"⚠ {w}")
+
+    # ★ 特征在脱敏之前算（脱敏改文本长度 → 污染语速与填充词）
+    feats = extract_features(tr, cfg.features)
+    print(f"语速 {feats.speech_rate} {feats.rate_unit}（{feats.rate_verdict}）")
+    print(f"停顿 {len(feats.pauses)} 次，最长 "
+          f"{feats.longest_pause.duration if feats.longest_pause else 0}s"
+          f"；卡壳 {sum(1 for p in feats.pauses if p.kind == '卡壳')} 次")
+    print(f"填充词 {feats.filler_count} 次（{feats.filler_verdict}）：{feats.fillers}")
+    print(f"节奏方差 {feats.rhythm_variance}"
+          f"{'  ⚠ 转写含低置信片段，数值仅供参考' if feats.low_confidence else ''}")
+
+    if not (with_report and cfg.diagnose.enabled):
+        return
+    try:
+        from agent_godot.core import load_registry
+        llm = load_registry().llm_for_mode("ask")
+        report = await diagnose(llm, tr, feats, cfg.diagnose)
+        print("\n" + report)
+        # 幻觉检测接口：LLM 若改了实测数值就是幻觉实锤（§1.3 ⑤）
+        if drift := verify_no_number_drift(report, feats):
+            print(f"\n⚠ 报告数值与实测不符：{drift}")
+    except Exception as e:                     # noqa: BLE001
+        print(f"\n（LLM 诊断不可用：{e}）")
+
+
+async def run_voice_chat(wav: str | None, out: str, lang: str) -> None:
+    """voice chat —— 全双工实时对话（打断 + 重叠流水线）。
+
+    音频输入：--wav 走文件回放（离线演示/延迟对拍）；否则从 stdin 读
+    16kHz s16le 单声道 PCM（Linux: `arecord -f S16_LE -c1 -r 16000 -t raw
+    | godot-agent voice chat`）。
+
+    音频输出：写 WAV 文件——服务端没有扬声器，播放归 M20 前端（浏览器）。
+    """
+    import asyncio
+
+    from agent_godot.voice.config import load_voice_config
+    from agent_godot.voice.realtime import RealtimeSession
+    from agent_godot.voice.stt import build_backends
+    from agent_godot.voice.stream_asr import LocalStreamTranscriber, make_policy
+    from agent_godot.voice.turn import build_turn_detector
+    from agent_godot.voice.tts import build_synthesizer
+
+    cfg = load_voice_config()
+    backends = build_backends(cfg.asr)
+    backend = backends.get(cfg.asr.default) or next(iter(backends.values()))
+    asr = LocalStreamTranscriber(backend, lang=lang or "zh",
+                                 min_chunk_s=cfg.realtime.min_chunk_s,
+                                 policy=make_policy(cfg.realtime.asr_policy,
+                                                    backend=backend))
+    synth = build_synthesizer(cfg.tts)
+    sink = _WavSink(Path(out), cfg.tts.sample_rate)
+
+    async def _llm(text: str):
+        from agent_godot.core import LLMRequest, Message, load_registry
+        llm = load_registry().llm_for_mode("ask")
+        resp = await llm.complete(LLMRequest(
+            model="voice-chat", stream=False,
+            messages=[Message(role="user", content=text)]))
+        # 一次性返回也要走分句器（韵律边界优先 + 长度兜底）
+        yield resp.content or ""
+
+    async def _mic():
+        if wav:
+            from agent_godot.voice.stream_asr import FileStreamTranscriber
+            async for c in FileStreamTranscriber(wav, realtime=False).chunks():
+                yield c
+            return
+        loop = asyncio.get_running_loop()
+        size = int(16000 * 20 / 1000) * 2        # 20ms 帧
+        while True:
+            data = await loop.run_in_executor(None, sys.stdin.buffer.read, size)
+            if not data:
+                return
+            yield data
+
+    session = RealtimeSession(
+        asr=asr, tts=synth, llm_stream=_llm, sink=sink, cfg=cfg.realtime,
+        turn_detector=build_turn_detector(
+            semantic=cfg.realtime.semantic_endpoint,
+            silence_ms=cfg.realtime.endpoint_silence_ms,
+            min_utterance_ms=cfg.realtime.min_utterance_ms))
+    try:
+        await session.run(_mic())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        n = sink.save()
+        print(f"\n已合成 {n} 字节音频 → {out}"
+              f"（首音时延 {session.ttfa_ms:.0f}ms）" if session.ttfa_ms
+              else f"\n已合成 {n} 字节音频 → {out}")
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")  # Windows GBK 终端：允许输出 ↳ 等符号
     parser = argparse.ArgumentParser(prog="godot-agent",
@@ -601,6 +803,29 @@ def main() -> None:
     ckpt.add_argument("action", choices=["save", "restore", "list"])
     ckpt.add_argument("name", nargs="?", default=None, help="存档名")
     ckpt.add_argument("--root", default=None, help="Godot 项目根（默认当前目录）")
+
+    # M16 语音三条产品线
+    voice = sub.add_parser("voice", help="语音：transcribe / analyze / chat（M16）")
+    vsub = voice.add_subparsers(dest="voice_cmd", required=True)
+
+    vt = vsub.add_parser("transcribe", help="音频转写（带词级时间戳）")
+    vt.add_argument("path", help="音频文件路径")
+    vt.add_argument("--lang", default="", help="语言代码，留空自动检测")
+    vt.add_argument("--fmt", default="text",
+                    choices=["text", "srt", "vtt", "json"], help="输出格式")
+    vt.add_argument("--high-accuracy", action="store_true",
+                    help="走高精度引擎（更慢，用于正式报告）")
+
+    va = vsub.add_parser("analyze", help="口语诊断（语速/停顿/填充词 + LLM 报告）")
+    va.add_argument("path", help="音频文件路径")
+    va.add_argument("--lang", default="", help="语言代码，留空自动检测")
+    va.add_argument("--no-report", action="store_true", help="只出实测特征，不调 LLM")
+
+    vc = vsub.add_parser("chat", help="全双工实时对话（打断 + 重叠流水线）")
+    vc.add_argument("--wav", default=None, help="从 WAV 回放代替麦克风")
+    vc.add_argument("--out", default="voice_reply.wav", help="TTS 输出 WAV 路径")
+    vc.add_argument("--lang", default="zh", help="对话语言")
+
     args = parser.parse_args()
 
     if args.command in ("ask", "craft"):
@@ -627,6 +852,15 @@ def main() -> None:
             print("save/restore 需要存档名")
             return
         asyncio.run(run_checkpoint(args.action, args.name or "", root))
+    elif args.command == "voice":
+        if args.voice_cmd == "transcribe":
+            asyncio.run(run_voice_transcribe(args.path, args.lang, args.fmt,
+                                             args.high_accuracy))
+        elif args.voice_cmd == "analyze":
+            asyncio.run(run_voice_analyze(args.path, args.lang,
+                                          not args.no_report))
+        elif args.voice_cmd == "chat":
+            asyncio.run(run_voice_chat(args.wav, args.out, args.lang))
 
 
 if __name__ == "__main__":

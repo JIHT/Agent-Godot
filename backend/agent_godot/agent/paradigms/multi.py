@@ -42,7 +42,8 @@ class MultiStrategy(ModeStrategy):
 
     def __init__(self, llm=None, loop=None, specs: dict | None = None,
                  registry=None, bus=None, max_parallel: int = 3,
-                 config: ModeConfig | None = None, **kwargs):
+                 config: ModeConfig | None = None, project_root=None,
+                 checkpoints=None, approver=None, **kwargs):
         super().__init__(config, **kwargs)
         self.llm = llm
         self.loop = loop
@@ -51,6 +52,11 @@ class MultiStrategy(ModeStrategy):
         self.bus = bus
         self.max_parallel = max_parallel
         self.orchestrator = None
+        # M15 第二轮加固（§1.4/§1.6）：编排器判定冲突要用项目根（受保护名单、
+        # 大小写折叠、CONSTRAINTS 加载、检查点快照都挂在它上面）
+        self.project_root = project_root
+        self.checkpoints = checkpoints
+        self.approver = approver
 
     # ---------- 装配（惰性：缺资源也能降级跑单代理） ----------
 
@@ -74,8 +80,10 @@ class MultiStrategy(ModeStrategy):
                 "multi 模式需要 LLM（任务拆解依赖它；注入 llm 或传入 loop）")
         bus = self.bus or getattr(self.loop, "bus", None)
         specs = self.specs or build_default_specs(registry)
-        self.orchestrator = Orchestrator(llm, specs, registry, bus,
-                                         max_parallel=self.max_parallel)
+        self.orchestrator = Orchestrator(
+            llm, specs, registry, bus, max_parallel=self.max_parallel,
+            project_root=self.project_root, checkpoints=self.checkpoints,
+            approver=self.approver)
         return self.orchestrator
 
     # ---------- 编排入口（CLI / 应用端走这条） ----------
